@@ -1,0 +1,19 @@
+[Unit]
+Description=pi-hunt CVE + attack-pattern freshness (KEV/NVD/EPSS -> RAG)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The pihunt-rag wrapper already sets PIHUNT_RAG_HOME / HF_HOME / PYTHONPATH.
+# --days 7 keeps the NVD pull small each tick; the full KEV catalog + EPSS are
+# refreshed every run. Add an NVD API key to go faster (optional):
+#   Environment=NVD_API_KEY=xxxxxxxx
+# Or for a fast, known-exploited-only tick, append: --kev-only
+ExecStart=__PIHUNT_HOME__/.local/bin/pihunt-rag cve-refresh --days 7
+TimeoutStartSec=0
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,23 @@
+[Unit]
+Description=pi-hunt continuous recon (refreshes all registered programs, feeds the RAG)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# fast mode on each tick keeps cadence cheap; run a manual --deep occasionally.
+Environment=PIHUNT_RAG_HOME=__PIHUNT_HOME__/.pi-hunt-rag
+Environment=PIHUNT_RECON_ROOT=__PIHUNT_HOME__/Desktop/Desktop/harness/reports
+Environment=PIHUNT_RECON_PROG_TIMEOUT=2700
+Environment=RECON_URL_DOMAIN_CAP=6
+Environment=RECON_GAU_TIMEOUT=45
+Environment=RECON_WAYBACK_TIMEOUT=45
+ExecStart=__PIHUNT_HOME__/.local/bin/pihunt-recon-scheduler --fast
+# The scheduler bounds each program (PIHUNT_RECON_PROG_TIMEOUT) and rotates on
+# timeout; no global kill that would abort the whole rotation.
+TimeoutStartSec=0
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

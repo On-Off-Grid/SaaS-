@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# pi-tier — cost/perf model tiering for the pi-hunt subagents.
+#
+# Three subagent classes:
+#   mechanical (8)             scope loading, recon mapping, account setup, UI
+#                              observation, payload lookup -> fast ref (Mistral)
+#   hunters (all other agents) exploit/analysis specialists -> hunter ref
+#                              (DeepSeek V4.1 Flash on AMD)
+#   elite pair                 strict-triager + hypothesis-redteam -> Kimi k3.1-pro
+#
+# The coordinator is separate: `pi-tier set-coordinator <provider/model[:thinking]>`
+# writes ~/.pi/agent/.coordinator-model, which pi-hunt reads at launch. This keeps
+# Kimi reserved for the elite pair while the coordinator runs on the cheap provider.
+#
+#   pi-tier on                         apply tiering (mechanical/hunters/elite)
+#   pi-tier off                        mechanical + hunters -> Kimi flagship fallback
+#   pi-tier status                     show current per-agent models and state
+#   pi-tier set-fast <provider/model>  change the mechanical model ref
+#   pi-tier set-hunter <provider/model> change the hunter model ref
+#   pi-tier set-flagship <model>       change the Kimi fallback used by `off`
+#   pi-tier set-coordinator <ref>      change the pi-hunt coordinator model
+#
+# Fast/hunter/coordinator refs must exist in ~/.pi/agent/models.json. Effect
+# applies to NEW subagent spawns; a running session keeps its model until relaunch.
+# The elite pair is always pinned to kimi-coding/k3.1-pro.
+set -uo pipefail
+
+AGENTS="$HOME/.pi/agent/agents"
+MODELS_JSON="$HOME/.pi/agent/models.json"
+FAST_STATE="$HOME/.pi/agent/.tier-state"
+HUNTER_STATE="$HOME/.pi/agent/.hunter-state"
+FLAGSHIP_STATE="$HOME/.pi/agent/.flagship-state"
+COORD_STATE="$HOME/.pi/agent/.coordinator-model"
+FAST_DEFAULT="mistral-direct/codestral-latest"
+HUNTER_DEFAULT="amd-radeon/DeepSeek-V4.1-Flash"
+FLAGSHIP_DEFAULT="kimi-coding/k3"
+COORD_DEFAULT="amd-radeon/DeepSeek-V4.1-Flash:high"
+KIMI="kimi-coding"
+
+ELITE_AGENTS=(
+  strict-triager
+  hypothesis-redteam
+)
+ELITE_DEFAULT="kimi-coding/k3.1-pro"
+
+FAST_AGENTS=(
+  h1-scope-loader
+  intigriti-scope-loader
+  yeswehack-scope-loader
+  recon
+  test-account-manager
+  visual-security
+  payload-researcher
+  wordlist-curator
+)
+
+ok(){ printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
+err(){ printf '  \033[1;31m✗ %s\033[0m\n' "$*"; }
+
+norm_ref(){ # bare kimi ids are accepted for backwards compatibility
+  local ref="${1:-}"
+  case "$ref" in
+    "" ) echo "";;
+    k3-256k|k3|k3.1-pro|k3.1-pro-highspeed) echo "$KIMI/$ref";;
+    */*) echo "$ref";;
+    *) echo "$KIMI/$ref";;
+  esac
+}
+
+state_ref(){ # file, default
+  local ref
+  ref=$( [ -f "$1" ] && grep -m1 . "$1" 2>/dev/null || true )
+  [ -n "$ref" ] && norm_ref "$ref" || norm_ref "$2"
+}
+
+fast_ref(){ state_ref "$FAST_STATE" "$FAST_DEFAULT"; }
+hunter_ref(){ state_ref "$HUNTER_STATE" "$HUNTER_DEFAULT"; }
+flagship_ref(){ state_ref "$FLAGSHIP_STATE" "$FLAGSHIP_DEFAULT"; }
+coord_ref(){ state_ref "$COORD_STATE" "$COORD_DEFAULT"; }
+
+have_model(){ # $1 = provider/model[:thinking]
+  local id="${1#*/}"
+  id="${id%%:*}"
+  grep -q "\"id\":[[:space:]]*\"$id\"" "$MODELS_JSON" 2>/dev/null
+}
+
+set_model(){ # $1=agent file, $2=full provider/model ref
+  sed -i -E "s|^model:[[:space:]]*.*$|model: $2|" "$1"
+}
+
+is_fast_agent(){ local a="$1"; for x in "${FAST_AGENTS[@]}"; do [ "$x" = "$a" ] && return 0; done; return 1; }
+is_elite_agent(){ local a="$1"; for x in "${ELITE_AGENTS[@]}"; do [ "$x" = "$a" ] && return 0; done; return 1; }
+is_hunter_agent(){ is_fast_agent "$1" && return 1; is_elite_agent "$1" && return 1; return 0; }
+
+agent_ref(){ # $1=agent file -> first provider/model ref found
+  grep -m1 -oE 'model:[[:space:]]*[a-zA-Z0-9-]+/[a-zA-Z0-9./:-]+' "$1" 2>/dev/null | sed -E 's|^model:[[:space:]]*||'
+}
+
+status(){
+  local n=0 nf=0 ne=0 nh=0
+  printf '  %-26s %-40s %s\n' "AGENT" "MODEL" "CLASS"
+  for f in "$AGENTS"/*.md; do
+    local a m; a=$(basename "$f" .md); m=$(agent_ref "$f")
+    if is_fast_agent "$a"; then printf '  %-26s %-40s (mechanical)\n' "$a" "$m"; nf=$((nf+1))
+    elif is_elite_agent "$a"; then printf '  %-26s %-40s (elite)\n' "$a" "$m"; ne=$((ne+1))
+    else printf '  %-26s %-40s (hunter)\n' "$a" "$m"; nh=$((nh+1)); fi
+    n=$((n+1))
+  done
+  echo "  fast=$(fast_ref) | hunter=$(hunter_ref) | kimi-fallback=$(flagship_ref) | coordinator=$(coord_ref)"
+  echo "  $n agents ($nf mechanical, $nh hunters, $ne elite)"
+}
+
+apply_on(){
+  local FM HM
+  FM=$(fast_ref); HM=$(hunter_ref)
+  case "$FM" in */*) ;; *) err "fast ref must be provider/model (got '$FM')"; exit 1;; esac
+  case "$HM" in */*) ;; *) err "hunter ref must be provider/model (got '$HM')"; exit 1;; esac
+  have_model "$FM" || { err "fast model '${FM#*/}' not in models.json"; exit 1; }
+  have_model "$HM" || { err "hunter model '${HM#*/}' not in models.json"; exit 1; }
+  for f in "$AGENTS"/*.md; do
+    a=$(basename "$f" .md)
+    if is_fast_agent "$a"; then set_model "$f" "$FM"
+    elif is_elite_agent "$a"; then set_model "$f" "$ELITE_DEFAULT"
+    else set_model "$f" "$HM"; fi
+  done
+  ok "tiering ON: ${#FAST_AGENTS[@]} mechanical -> $FM | hunters -> $HM | ${#ELITE_AGENTS[@]} elite -> $ELITE_DEFAULT"
+  ok "coordinator unchanged: $(coord_ref) (use 'pi-tier set-coordinator <ref>' to change)"
+  status
+}
+
+apply_off(){
+  local FL
+  FL=$(flagship_ref)
+  case "$FL" in */*) ;; *) err "flagship ref must be provider/model (got '$FL')"; exit 1;; esac
+  have_model "$FL" || { err "flagship model '${FL#*/}' not in models.json"; exit 1; }
+  for f in "$AGENTS"/*.md; do
+    a=$(basename "$f" .md)
+    if is_elite_agent "$a"; then set_model "$f" "$ELITE_DEFAULT"
+    else set_model "$f" "$FL"; fi
+  done
+  ok "tiering OFF: all non-elite agents -> $FL | elite stays $ELITE_DEFAULT"
+  ok "coordinator unchanged: $(coord_ref)"
+  status
+}
+
+set_state(){
+  local file="$1" ref="$2" label="$3"
+  ref=$(norm_ref "$ref")
+  case "$ref" in */*) ;; *) err "$label ref must be provider/model (got '$ref')"; exit 1;; esac
+  have_model "$ref" || { err "model '${ref#*/}' not in models.json"; exit 1; }
+  echo "$ref" > "$file"; ok "$label ref = $ref (run 'pi-tier on' to apply)"
+}
+
+case "${1:-status}" in
+  on) apply_on ;;
+  off) apply_off ;;
+  set-fast)
+    [ -n "${2:-}" ] || { err "usage: pi-tier set-fast <provider/model>"; exit 1; }
+    set_state "$FAST_STATE" "$2" "fast" ;;
+  set-hunter)
+    [ -n "${2:-}" ] || { err "usage: pi-tier set-hunter <provider/model>"; exit 1; }
+    set_state "$HUNTER_STATE" "$2" "hunter" ;;
+  set-flagship)
+    [ -n "${2:-}" ] || { err "usage: pi-tier set-flagship <model>"; exit 1; }
+    set_state "$FLAGSHIP_STATE" "$2" "Kimi fallback" ;;
+  set-coordinator)
+    [ -n "${2:-}" ] || { err "usage: pi-tier set-coordinator <provider/model[:thinking]>"; exit 1; }
+    set_state "$COORD_STATE" "$2" "coordinator" ;;
+  status|"") status ;;
+  -h|--help|help) sed -n '2,28p' "$0" | sed 's/^#\s\?//' ;;
+  *) err "usage: pi-tier {on|off|status|set-fast|set-hunter|set-flagship|set-coordinator}";;
+esac

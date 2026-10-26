@@ -1,0 +1,13 @@
+[Unit]
+Description=pi-hunt CVE freshness cadence (refresh KEV/NVD/EPSS into the RAG)
+
+[Timer]
+# first run 10 min after boot/login, then daily; catch up if missed.
+OnBootSec=10min
+OnUnitActiveSec=24h
+Persistent=true
+# spread the NVD pull off a predictable minute to stay polite to the feed.
+RandomizedDelaySec=1800
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,29 @@
+#!/usr/bin/env sh
+# pre-commit: block commits where the prompt fleet breaks any invariant.
+#
+# Runs the full prompt gate: build drift, signature behaviours, reference
+# resolution (repo + deployed), installer coverage, reverse drift, token
+# budgets, and the static output-schema check.
+#
+#   Fix: make prompts && git add pi-agent/agents skills/manifest.json
+#   Bypass (use sparingly): git commit --no-verify
+#
+# Install once: make hooks   (sets core.hooksPath=.githooks)
+
+set -u
+
+if [ ! -f bin/prompt-gate.mjs ]; then
+  exit 0
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "pre-commit: node not found — skipping prompt gate" >&2
+  exit 0
+fi
+
+if ! node bin/prompt-gate.mjs; then
+  echo "" >&2
+  echo "pre-commit: BLOCKED — prompt gate failed (see stages above)." >&2
+  echo "  Rebuild with 'make prompts', then stage pi-agent/agents (+ skills/manifest.json)." >&2
+  exit 1
+fi

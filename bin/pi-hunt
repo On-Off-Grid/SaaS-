@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# pi-hunt — run pi.dev as the bug-bounty coordinator.
+# Loads the coordinator brain (build.md) + workflow rules (bugbounty-autoflow.md) +
+# a pi execution adapter, with all 26 specialist subagents and the MCP tools available.
+# Routing (Kimi elite-only):
+#   coordinator + 16 hunters -> amd-radeon/DeepSeek-V4.1-Flash
+#   8 mechanical agents      -> mistral-direct/codestral-latest
+#   elite pair               -> kimi-coding/k3.1-pro (strict-triager, hypothesis-redteam)
+# The coordinator model is read from ~/.pi/agent/.coordinator-model; override for one
+# launch with PIHUNT_COORDINATOR_MODEL=provider/model[:thinking]. Manage the rest with
+# pi-tier (pi-4.8 is the legacy Kimi flagship quality toggle).
+# NOTE: launch Burp Suite (AI-Agent extension listening on 127.0.0.1:9876) before
+# running if you want Burp MCP tools in the session.
+#
+# Usage:
+#   pi-hunt                                   # interactive; then type: Hunt <program> for CRITICAL
+#   pi-hunt "Hunt <program> for CRITICAL/EXCEPTIONAL"
+#   pi-hunt -p "Hunt <program> for CRITICAL"  # one-shot (headless)
+set -uo pipefail
+
+# Auto-continue watchdog: ENABLED. Root-caused stall: a turn whose only action is
+# a gateway-resolved web_search (Path B) reports stop_reason=end_turn with no
+# client tool_blocks, so pi treats it as the model's FINAL answer and idles even
+# though the model intended to act on the search results (the 2026-06-16 yahoo
+# "Scout AI" stop). web_search is resolved server-side and is NOT in pi's tool
+# registry, so the gateway cannot emit stop_reason=tool_use without hanging pi.
+# The watchdog is the correct mechanism: on a no-tool end_turn during a hunt it
+# auto-sends one "continue" so the coordinator proceeds. It is TUI-only, never runs
+# in subagents/headless, respects [[HUNT_COMPLETE]]/[[HUNT_BLOCKED]], and is capped
+# (PI_AUTOCONTINUE_MAX_EMPTY=3 consecutive no-progress turns, PI_AUTOCONTINUE_MAX=400
+# lifetime). Toggle off live with /autocontinue off, or set this back to 0.
+export PI_AUTOCONTINUE=1
+
+# compact-on-46 empty-trigger: ENABLED. There are TWO distinct large-context empty triggers
+# (both proven by deterministic gateway replay 2026-06-18):
+#   (A) Concentrated high-entropy BLOBS in tool results - base64 screenshots/images and
+#       long opaque tokens/JWTs/signed-URL/error blobs. FIXED at the gateway by eliding
+#       (ELIDE_STALE_TOOL_IMAGES + ELIDE_HIGH_ENTROPY_TOKENS with a tokenizer-fragmentation
+#       discriminator). This is the farfetch case and the gateway handles it model-wide.
+#   (B) Sheer token VOLUME (~150k+) with no concentrated blob to remove - proven on
+#       cambium: eliding all opaque tokens / killing all entropy (volume held constant)
+#       still empties, and padding a small OK request with ~105k of pure BENIGN prose
+#       reproduces the empty. The gateway CANNOT fix this (nothing to elide); only
+#       COMPACTION reduces the volume. Empirically empties are probabilistic and rise
+#       with volume (gw.log: empty median ~64k vs OK median ~232k, overlapping).
+# Legacy compact-on-46 empty-trigger: DISABLED. It used Kimi k3-256k as the
+# summarizer. The coordinator/hunters are now capped at 98k, so the built-in
+# threshold compaction on the active DeepSeek model keeps volume bounded, and
+# auto-continue handles an empty stall. Kimi stays reserved for the elite pair.
+export COMPACT_ON_46="0"
+
+BUILD="__PIHUNT_HOME__/.config/opencode/prompts/claude-agents/build.md"
+FLOW="__PIHUNT_HOME__/.pi/agent/steering/bugbounty-autoflow.md"
+ADAPT="__PIHUNT_HOME__/.pi/agent/pi-coordinator-adapter.md"
+
+for f in "$BUILD" "$FLOW" "$ADAPT"; do
+  [ -r "$f" ] || { echo "pi-hunt: missing coordinator prompt: $f" >&2; exit 1; }
+done
+
+# Canonical recon front door. Every agent/CLI/RAG reader uses reports/<program>/structured-recon;
+# the engine writes there instead of the legacy ~/hunts tree.
+PIHUNT_REPO="${PIHUNT_REPO:-__PIHUNT_HOME__/Desktop/Desktop/harness}"
+export PIHUNT_RECON_ROOT="${PIHUNT_RECON_ROOT:-$PIHUNT_REPO/reports}"
+
+# Coordinator model is state-driven so pi-tier/pi-4.8 can change it without editing
+# this launcher. Default is the cheap non-Kimi coordinator; Kimi stays elite-only.
+COORD_STATE="$HOME/.pi/agent/.coordinator-model"
+COORD_MODEL="${PIHUNT_COORDINATOR_MODEL:-$(cat "$COORD_STATE" 2>/dev/null || true)}"
+[ -n "$COORD_MODEL" ] || COORD_MODEL="amd-radeon/DeepSeek-V4.1-Flash:high"
+
+exec pi --model "$COORD_MODEL" \
+  --append-system-prompt "$BUILD" \
+  --append-system-prompt "$FLOW" \
+  --append-system-prompt "$ADAPT" \
+  "$@"
