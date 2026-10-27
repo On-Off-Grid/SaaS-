@@ -23,6 +23,7 @@ const chk = (label, cond) => {
 
 const {
   detectBrowserWall,
+  wallKind,
   extractNeedHuman,
   isBrowserTool,
   shouldAlertNeedHuman,
@@ -36,26 +37,41 @@ chk("read is not browser", !isBrowserTool("read"));
 chk("bash is not browser", !isBrowserTool("bash"));
 chk("empty tool name is not browser", !isBrowserTool(""));
 
-console.log("\n[2] high-confidence browser walls");
+console.log("\n[2] high-confidence browser walls (marker-backed)");
 chk(
-  "cloudflare just-a-moment snapshot",
+  "cloudflare interstitial with challenge-platform marker",
   detectBrowserWall(
-    'RootWebArea "Just a moment..." url="https://example.com"\nIframe "challenge"\nStaticText "Verify you are human"',
+    'RootWebArea "Just a moment..." url="https://example.com"\nscript src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/..."\nStaticText "Verify you are human"',
   ) !== null,
 );
 chk("recaptcha", detectBrowserWall('StaticText "Please complete the reCAPTCHA"') !== null);
 chk("turnstile", detectBrowserWall('StaticText "Turnstile verification"') !== null);
+chk("hcaptcha widget", detectBrowserWall('iframe src="https://hcaptcha.com/1/api.js"') !== null);
 chk("otp code entry", detectBrowserWall('textbox "Enter the code sent to your email"') !== null);
 chk("2fa code", detectBrowserWall('StaticText "2FA code required"') !== null);
 chk("manual verification", detectBrowserWall('StaticText "Manual verification required"') !== null);
 
-console.log("\n[3] old false positives stay silent");
+console.log("\n[3] false positives stay silent");
 chk("bare 2fa", detectBrowserWall("2FA is enabled on the account") === null);
 chk("rate limit", detectBrowserWall("429 rate limit exceeded") === null);
 chk("access denied", detectBrowserWall("403 access denied") === null);
 chk("api quota", detectBrowserWall("api key quota exceeded") === null);
 chk("payment wall", detectBrowserWall("payment required") === null);
 chk("banned", detectBrowserWall("account banned") === null);
+// New strict-heuristic cases: soft phrases alone must not ring the desk.
+chk("verify-you-are-human phrase alone", detectBrowserWall('StaticText "Verify you are human"') === null);
+chk("just-a-moment phrase alone", detectBrowserWall('RootWebArea "Just a moment..."') === null);
+chk("checking-your-browser alone", detectBrowserWall("Checking your browser before accessing the site") === null);
+chk("editorial captcha mention", detectBrowserWall("The docs explain how to solve a captcha on the login page") === null);
+chk("login UI verification code label", detectBrowserWall('StaticText "Enter your verification code"') !== null); // OTP stays
+
+console.log("\n[3b] wall-kind routing");
+chk("challenge marker -> captcha", wallKind("cdn-cgi/challenge-platform") === "captcha");
+chk("turnstile -> captcha", wallKind('"Turnstile verification"') === "captcha");
+chk("otp -> otp", wallKind("Enter the code sent to you") === "otp");
+chk("manual -> manual", wallKind("Manual verification required") === "manual");
+chk("plain text -> null", wallKind("ordinary page content") === null);
+chk("soft phrase alone -> null", wallKind("verify you are human") === null);
 
 console.log("\n[4] explicit NEED_HUMAN extraction");
 chk("reason extracted", extractNeedHuman("Blocked. NEED_HUMAN: solve the CAPTCHA") === "solve the CAPTCHA");
