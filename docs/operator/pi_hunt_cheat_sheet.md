@@ -2,6 +2,8 @@
 
 This cheat sheet provides actionable instructions, grammar templates, and best practices for optimal and token-efficient steering of the `pi-hunt` coordinator.
 
+> For model/provider orchestration (`pi-tier`, the failover watchers) and the recon-synthesis tooling (`pihunt-gadgets`, `pihunt-authz`, the gadget graph), see **`pi-hunt-tooling-cheatsheet.md`** in this folder.
+
 ---
 
 ## 1. Quick Reference & Triggers
