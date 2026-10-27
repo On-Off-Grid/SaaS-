@@ -8,9 +8,13 @@
  *   1. Explicit: assistant text containing `NEED_HUMAN: <reason>` while a
  *      `browser_live_*` tool was used recently (or the reason itself names a
  *      high-confidence browser wall).
- *   2. Heuristic: a `browser_live_*` tool result containing a CAPTCHA /
- *      Cloudflare challenge, an OTP/code-entry prompt, or an explicit manual
- *      browser handoff.
+ *   2. Heuristic (strict): a `browser_live_*` tool result containing a
+ *      vendor/challenge-infrastructure CAPTCHA marker (recaptcha, turnstile,
+ *      cdn-cgi/challenge-platform, …), an OTP/code-entry prompt, or an explicit
+ *      manual browser handoff. Bare English phrases ("verify you are human",
+ *      "just a moment") no longer fire on their own. Captcha walls are held for
+ *      PIHUNT_ALERT_CONFIRM_MS and only fire if the agent did not move on (a
+ *      transient Cloudflare interstitial the browser auto-passes stays silent).
  *
  * Non-browser operator blockers (API quota, missing credentials, legal/scope
  * calls) should use `[[HUNT_BLOCKED: ...]]` in the coordinator prompt. That
@@ -24,8 +28,8 @@
  *   - Non-blocking: spawn() fire-and-forget; errors are swallowed.
  *
  * Tunables (env): PIHUNT_ALERT, PIHUNT_ALERT_COOLDOWN_MS,
- * PIHUNT_ALERT_BROWSER_CONTEXT_MS, PIHUNT_ALERT_DRY_RUN,
- * PIHUNT_ALERT_STATE_DIR, PIHUNT_ALERT_VOICE.
+ * PIHUNT_ALERT_BROWSER_CONTEXT_MS, PIHUNT_ALERT_CONFIRM_MS,
+ * PIHUNT_ALERT_DRY_RUN, PIHUNT_ALERT_STATE_DIR, PIHUNT_ALERT_VOICE.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -37,6 +41,7 @@ import {
   isBrowserTool,
   shouldAlertNeedHuman,
   textOf,
+  wallKind,
 } from "./classify.ts";
 
 function envMs(name: string, fallback: number): number {
@@ -50,10 +55,17 @@ const enabled = () => process.env.PIHUNT_ALERT !== "0";
 const COOLDOWN_MS = envMs("PIHUNT_ALERT_COOLDOWN_MS", 60_000);
 const BROWSER_CONTEXT_MS = envMs("PIHUNT_ALERT_BROWSER_CONTEXT_MS", 120_000);
 const DRY_RUN = process.env.PIHUNT_ALERT_DRY_RUN === "1";
+// Captcha walls are transient-prone: a Cloudflare interstitial the browser
+// auto-passes should not ring the desk. Hold the alert for CONFIRM_MS and only
+// fire if no newer browser result arrived (the agent is still stuck on it).
+const CONFIRM_MS = envMs("PIHUNT_ALERT_CONFIRM_MS", 15_000);
 const VOICE = process.env.PIHUNT_ALERT_VOICE || "Human intervention needed, the bug bounty hunt is waiting on you.";
 const SOUND = "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga";
 
 let lastBrowserAt = 0;
+// Monotonic per-process counter of browser results. Used to tell whether the
+// agent moved on after a captcha wall (bypassed) or is still sitting on it.
+let browserSeq = 0;
 
 function run(cmd: string, args: string[]): void {
   try {
@@ -117,9 +129,28 @@ export default function humanAlert(pi: ExtensionAPI) {
       if (!isBrowserTool(tool)) return;
 
       lastBrowserAt = Date.now();
-      const wall = detectBrowserWall(textOf(event?.content));
+      browserSeq++;
+      const text = textOf(event?.content);
+      const wall = detectBrowserWall(text);
       if (!wall) return;
-      alarm(`${tool} hit a wall: ${wall}`, `browser-wall:${wall.toLowerCase()}`);
+      const key = `browser-wall:${wall.toLowerCase()}`;
+
+      if (wallKind(text) === "captcha") {
+        // Confirm the agent is actually blocked: a transient challenge the
+        // browser passes is followed by another browser result (browserSeq
+        // advances) -> it was bypassed, stay silent. A genuinely stuck agent
+        // produces no further browser output -> fire after the window.
+        const seqAtDetect = browserSeq;
+        const t = setTimeout(() => {
+          if (browserSeq > seqAtDetect) return; // agent progressed; wall cleared
+          alarm(`${tool} hit a wall: ${wall}`, key);
+        }, CONFIRM_MS);
+        if (typeof (t as any).unref === "function") (t as any).unref();
+        return;
+      }
+
+      // OTP / manual handoff: not transient and valued — fire immediately.
+      alarm(`${tool} hit a wall: ${wall}`, key);
     } catch {
       /* never break the loop */
     }
