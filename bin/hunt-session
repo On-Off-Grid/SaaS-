@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# hunt-session — campaign orchestration for a dedicated DigitalOcean run.
+#
+# Thin wrapper over the primitives (pi-tier, pihunt-gadgets/authz/triage) that
+# sequences them correctly and quota-aware, so a hunt day is a one-liner and a
+# teardown is a one-liner. Nothing here is new capability — it is the *order* and
+# the *reasoning*, captured so it is reproducible and not re-derived each time.
+#
+#   hunt-session preflight   read-only: stale procs + watcher pidfiles + live quotas
+#   hunt-session up          clear stale state -> tier on -> size concurrency -> watchers
+#   hunt-session steer       the synthesis snapshot: where to spend budget right now
+#   hunt-session status      compact "what's running + current quota" view
+#   hunt-session down        stop all watchers, clear pidfiles (clean teardown)
+#
+# Design decisions:
+#   * Quota-dependence lives in `pi-tier concurrency` (3 providers up -> 6, 2 -> 4,
+#     OpenRouter-only/none -> 3) and in the failover watchers (hybrid, amd-fallback,
+#     coord-health). `up` just starts them in the right order; it does not hardcode a
+#     provider — the watchers react to live quota. So "config depends on quotas"
+#     without a brittle if-ladder here.
+#   * `up` sets PIHUNT_CASEFILE to THIS repo's casefile so stall-watch alarms on the
+#     right hunt regardless of the watcher's cwd.
+#   * Concurrency applies at the NEXT launch (pi reads env at start). `up` sizes the
+#     file and leaves the launch to you, so you re-source the env in a fresh shell.
+#   * Idempotent: `up` clears stale pidfiles first; `down` is safe to run twice.
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PATH="$HOME/.local/bin:$REPO/bin:$PATH"
+PROG="${PIHUNT_PROGRAM:-digitalocean}"
+export PIHUNT_CASEFILE="$REPO/.pi/casefile.jsonl"
+PIDDIR="$HOME/.pi/agent"
+WATCHERS=(hybrid amdfb coordh concwatch stallwatch)   # pidfile basenames
+
+c_hdr(){ printf '\n\033[1;36m==== %s ====\033[0m\n' "$*"; }
+
+clear_stale_pidfiles(){
+  local w f p n=0
+  for w in "${WATCHERS[@]}"; do
+    f="$PIDDIR/.$w.pid"; [ -f "$f" ] || continue
+    p="$(cat "$f" 2>/dev/null)"
+    if ! kill -0 "$p" 2>/dev/null; then rm -f "$f"; n=$((n+1)); fi
+  done
+  echo "cleared $n stale watcher pidfile(s)"
+}
+
+cmd_preflight(){
+  c_hdr "stale processes"
+  if pgrep -x pi >/dev/null 2>&1; then
+    echo "  pi RUNNING (a hunt is live): $(pgrep -x pi | tr '\n' ' ')"
+  else echo "  no pi coordinator/subagents running"; fi
+  local w f p
+  for w in "${WATCHERS[@]}"; do
+    f="$PIDDIR/.$w.pid"
+    if [ -f "$f" ]; then p="$(cat "$f" 2>/dev/null)"
+      kill -0 "$p" 2>/dev/null && echo "  watcher $w: running (pid $p)" || echo "  watcher $w: STALE pidfile (pid $p dead)"
+    fi
+  done
+  pgrep -af 'chromium --headless' >/dev/null 2>&1 && echo "  note: headless chromium present (screenshot/render leftovers?)"
+  c_hdr "quota / provider state"
+  pi-tier concurrency status
+  echo; pi-tier coord-health status
+  echo; pi-tier hybrid status
+  echo; pi-tier amd-fallback status
+}
+
+cmd_up(){
+  c_hdr "fresh config (quota-aware)"
+  clear_stale_pidfiles
+  pi-tier on                 # mechanical->Mistral, hunters+coord->AMD DeepSeek, elite->Kimi
+  pi-tier concurrency once    # size PI_SUBAGENT_MAX_CONCURRENCY from providers up RIGHT NOW
+  c_hdr "start failover + safety watchers"
+  pi-tier hybrid watch 300 &        # elite pair Kimi<->AMD on Kimi's 5h window
+  pi-tier amd-fallback watch 300 &  # AMD $1/day cap -> OpenRouter, back on reset
+  pi-tier coord-health watch 120 &  # coordinator provider down -> stage healthy fallback
+  pi-tier concurrency watch 300 &   # keep concurrency sized as providers flap
+  pi-tier stall-watch watch 120 &   # ring the desk if the hunt goes idle/hung
+  sleep 1
+  c_hdr "next"
+  echo "  re-source the env in a FRESH shell so concurrency applies at launch:"
+  echo "    source ~/.pi/secrets/pihunt-tuning.env"
+  echo "  then launch:"
+  echo "    pi-hunt"
+  echo "    > Hunt $PROG in Intigriti for CRITICAL/EXCEPTIONAL"
+}
+
+cmd_steer(){
+  c_hdr "where to spend budget (gadget graph)"; pihunt-gadgets rank --program "$PROG"
+  c_hdr "forgotten-sibling-verb cells";          pihunt-authz gaps  --program "$PROG"
+  c_hdr "re-arm triggers (reopenable kills)";     pihunt-gadgets triggers --program "$PROG"
+  c_hdr "submission scoreboard";                  pihunt-triage report --program "$PROG" >/dev/null 2>&1 \
+    && sed -n '1,12p' "$REPO/reports/$PROG/structured-recon/submissions-report.md" 2>/dev/null
+}
+
+cmd_status(){
+  c_hdr "running"
+  pgrep -x pi >/dev/null 2>&1 && echo "  hunt: LIVE (pi $(pgrep -x pi | tr '\n' ' '))" || echo "  hunt: not running"
+  local w f p
+  for w in "${WATCHERS[@]}"; do
+    f="$PIDDIR/.$w.pid"; [ -f "$f" ] || continue
+    p="$(cat "$f" 2>/dev/null)"; kill -0 "$p" 2>/dev/null && echo "  watcher $w: up (pid $p)"
+  done
+  c_hdr "quota"; pi-tier concurrency status
+}
+
+cmd_down(){
+  c_hdr "teardown"
+  for sub in hybrid amd-fallback coord-health concurrency stall-watch; do pi-tier "$sub" off; done
+  clear_stale_pidfiles
+  echo "watchers stopped. (a running pi coordinator, if any, is left alone — stop it in its TUI.)"
+}
+
+case "${1:-preflight}" in
+  preflight|pre) cmd_preflight ;;
+  up|start)      cmd_up ;;
+  steer)         cmd_steer ;;
+  status)        cmd_status ;;
+  down|stop)     cmd_down ;;
+  *) echo "usage: hunt-session {preflight|up|steer|status|down}"; exit 2 ;;
+esac

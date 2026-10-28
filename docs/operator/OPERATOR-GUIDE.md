@@ -13,6 +13,11 @@ dives are linked at the end; this page is the routine.
 
 ## 0. TL;DR routine
 
+> One-shot wrapper: `hunt-session preflight | up | steer | status | down` runs this
+> whole routine quota-aware (`up` = the BEFORE block, `steer` = §6 snapshot,
+> `down` = teardown). Evidence screenshots for a submission: `submission-shots
+> <replay-dir>`. The explicit commands:
+
 ```bash
 # BEFORE
 pi-tier on                                  # apply model tiering

@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""submission-shots — redacted evidence screenshots for a bug-bounty submission.
+
+Generalised from the Harness-transfer-BOLA workflow. Point it at a directory of
+captured API responses (`*.json`, optionally paired with `*.status` holding the
+HTTP code) and it renders each as a dark terminal-style PNG with presigned-URL
+credentials (`X-Amz-Signature` / `X-Amz-Credential`) redacted — ready to drag into
+the platform's PoC editor where inline screenshots are mandatory.
+
+Why rendered PNGs of saved responses (not re-running live):
+  * no new requests against the target; the saved replay is the evidence,
+  * credentials are masked in code (never a manual copy/paste slip),
+  * object keys / ids / proof params stay visible (they prove the cross-tenant hit).
+
+Usage:
+  submission-shots <artifacts-dir> [--out DIR] [--mask REGEX ...] [--only SUBSTR]
+                                   [--raw FILE ...]
+    <artifacts-dir>  dir of NN_name.json (+ optional NN_name.status). Rendered in
+                     sorted filename order so A<B<C maps to your PoC step order.
+    --out DIR        output dir (default: <artifacts-dir>/../screenshots)
+    --mask REGEX     extra value to redact (repeatable), e.g. a bearer/email/id
+    --only SUBSTR    only render json files whose name contains SUBSTR
+    --raw FILE       also render a plain text file (e.g. a terminal poc-output.txt),
+                     redacted, as one PNG (repeatable)
+
+Requires: chromium (headless) + a mono font (DejaVu Sans Mono). No network, no creds printed.
+"""
+import json
+import os
+import re
+import sys
+import math
+import html
+import shutil
+import subprocess
+
+# Always-on redaction: AWS SigV4 presigned credential material.
+BASE_MASKS = [r'(X-Amz-(?:Signature|Credential)=)[^&"\s]+']
+
+PAGE = """<!doctype html><html><head><meta charset="utf-8"><style>
+:root{{color-scheme:dark}}html,body{{margin:0;background:#0d1117}}
+.wrap{{padding:22px 24px;font:15px/1.5 'DejaVu Sans Mono',monospace;color:#c9d1d9}}
+.cmd{{color:#7ee787}}.cmd .d{{color:#58a6ff}}.status{{font-weight:bold}}
+.ok{{color:#3fb950}}.warn{{color:#d29922}}.bad{{color:#f85149}}
+pre{{margin:10px 0 0;white-space:pre-wrap;word-break:break-all}}
+.red{{color:#f85149;font-weight:bold}}
+</style></head><body><div class="wrap">
+<div class="cmd"><span class="d">$</span> {cmd}</div>{statusline}
+<pre>{body}</pre></div></body></html>"""
+
+
+def chromium_bin():
+    for c in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+        if shutil.which(c):
+            return c
+    sys.exit("error: no chromium/chrome found (needed for headless render).")
+
+
+def status_class(code):
+    if code.startswith("2"):
+        return "ok"
+    if code in ("403", "404", "409", "429"):
+        return "warn"
+    return "bad" if code[:1] in ("4", "5") else ""
+
+
+def redact(s, masks):
+    for pat in masks:
+        s = re.sub(pat, lambda m: (m.group(1) if m.groups() else "") + "<REDACTED>", s)
+    return s
+
+
+def render(html_str, png, lines, chrome):
+    h = 90 + lines * 23 + 24
+    tmp = png + ".html"
+    open(tmp, "w").write(html_str)
+    subprocess.run([chrome, "--headless=new", "--no-sandbox", "--disable-gpu",
+                    "--hide-scrollbars", "--force-device-scale-factor=2",
+                    "--user-data-dir=/tmp/subshots-chrome",
+                    f"--window-size=1000,{h}", f"--screenshot={png}", f"file://{tmp}"],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.remove(tmp)
+
+
+def body_html(text):
+    return html.escape(text).replace("&lt;REDACTED&gt;", '<span class="red">&lt;REDACTED&gt;</span>')
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    adir = argv[0]
+    out = None
+    masks = list(BASE_MASKS)
+    only = None
+    raws = []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--out":
+            out = argv[i + 1]; i += 2
+        elif a == "--mask":
+            masks.append(argv[i + 1]); i += 2
+        elif a == "--only":
+            only = argv[i + 1]; i += 2
+        elif a == "--raw":
+            raws.append(argv[i + 1]); i += 2
+        else:
+            sys.exit(f"unknown arg: {a}")
+    if not os.path.isdir(adir):
+        sys.exit(f"not a directory: {adir}")
+    out = out or os.path.join(os.path.dirname(os.path.abspath(adir.rstrip("/"))), "screenshots")
+    os.makedirs(out, exist_ok=True)
+    chrome = chromium_bin()
+
+    jsons = sorted(f for f in os.listdir(adir) if f.endswith(".json") and (not only or only in f))
+    n = 0
+    for jf in jsons:
+        base = jf[:-5]
+        raw = open(os.path.join(adir, jf)).read().strip()
+        try:
+            body = json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
+        except Exception:
+            body = raw
+        body = redact(body, masks)
+        sp = os.path.join(adir, base + ".status")
+        statusline = ""
+        if os.path.exists(sp):
+            code = open(sp).read().strip()
+            statusline = f'\n<div class="status {status_class(code)}">HTTP {code}</div>'
+        page = PAGE.format(cmd=html.escape(base), statusline=statusline, body=body_html(body))
+        lines = sum(max(1, math.ceil(len(x) / 104)) for x in body.splitlines() or [""]) + 1
+        png = os.path.join(out, base + ".png")
+        render(page, png, lines, chrome)
+        n += 1
+        print(f"  {base}.png")
+    for rf in raws:
+        text = redact(open(rf).read(), masks)
+        base = os.path.splitext(os.path.basename(rf))[0] + "_raw"
+        page = PAGE.format(cmd=html.escape(os.path.basename(rf)), statusline="", body=body_html(text))
+        lines = sum(max(1, math.ceil(len(x) / 104)) for x in text.splitlines() or [""]) + 1
+        png = os.path.join(out, base + ".png")
+        render(page, png, lines, chrome)
+        n += 1
+        print(f"  {base}.png")
+
+    print(f"\nrendered {n} screenshot(s) -> {out}")
+    print("REMINDER: eyeball the PNGs for any un-masked secret before uploading; "
+          "pass --mask '<regex>' to redact anything else (bearer tokens, emails, ids).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
