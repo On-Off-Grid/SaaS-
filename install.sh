@@ -119,8 +119,8 @@ else warn "rag/install-rag.sh not bundled — skipping RAG"; fi
 
 c "6/7  launchers  ->  $H/.local/bin"
 run "mkdir -p '$H/.local/bin'"
-for l in pi-hunt pi-4.8 pi-tier pihunt-gadgets pihunt-authz pihunt-triage hunt-session submission-shots; do [ -f "$SRC/bin/$l" ] || continue; bk "$H/.local/bin/$l"; run "cp -p '$SRC/bin/$l' '$H/.local/bin/$l'"; rehome "$H/.local/bin/$l"; run "chmod +x '$H/.local/bin/$l'"; done
-ok "pi-hunt (Kimi Code), pi-4.8 (flagship toggle), pi-tier (cost tiering)"
+for l in pi-hunt pi-tier pihunt-gadgets pihunt-authz pihunt-triage hunt-session hunt-brief submission-shots; do [ -f "$SRC/bin/$l" ] || continue; bk "$H/.local/bin/$l"; run "cp -p '$SRC/bin/$l' '$H/.local/bin/$l'"; rehome "$H/.local/bin/$l"; run "chmod +x '$H/.local/bin/$l'"; done
+ok "pi-hunt (Kimi Code), pi-tier (cost tiering), hunt-session + hunt-brief (session routine)"
 # continuous-recon engine + scheduler + registry helper
 if [ -d "$SRC/recon" ]; then
   run "cp -p '$SRC/recon/recon-engine.sh' '$H/.local/bin/pihunt-recon'" && run "chmod +x '$H/.local/bin/pihunt-recon'"

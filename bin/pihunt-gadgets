@@ -22,6 +22,9 @@ Only reads graph/trigger/case files; prints no credentials.
 Usage:
   pihunt-gadgets rank     [--program P]   ranked missing-capability shopping list
   pihunt-gadgets chains   [--program P]   per-chain composability
+  pihunt-gadgets patterns [--program P]   each chain -> the practitioner pattern it
+                                          instantiates + the next link it predicts
+  pihunt-gadgets suggest  [--program P]   the single best next action (rank+pattern)
   pihunt-gadgets triggers [--program P]   which re-arm triggers are ARMED vs WAITING
   pihunt-gadgets check    [--program P]   exit 10 if any trigger is ARMED (for recon)
   pihunt-gadgets report   [--program P]   write structured-recon/gadgets-report.md
@@ -83,10 +86,21 @@ def load_graph(prog):
     granted = set()      # capabilities a confirmed gadget grants
     negative = set()     # capabilities a probe ran and found absent
     for g in gadgets:
-        tgt = granted if g.get("status") == "confirmed" else (
-            negative if g.get("status") == "negative" else set())
-        for c in g.get("grants", []):
-            tgt.add(c)
+        if g.get("status") == "confirmed":
+            for c in g.get("grants", []):
+                granted.add(c)
+        elif g.get("status") == "negative":
+            # A negative probe records the ABSENT capability either in `grants`
+            # or (older rows) as the node `id` itself. Harvest both so a chain
+            # that NEEDS a probed-negative capability is reconciled as dead
+            # instead of resurfacing as a top actionable primitive. The `.`
+            # guard skips opaque ids (p_harness_session_authz) whose capability
+            # lives in `grants`; capability ids (probe.microvm_cross_id) match.
+            for c in g.get("grants", []):
+                negative.add(c)
+            gid = g.get("id", "")
+            if "." in gid:
+                negative.add(gid)
     return gadgets, chains, granted, negative
 
 
@@ -107,11 +121,12 @@ CLS_LABEL = {
 CLS_RANK = {"probe": 2, "account": 1, "gadget": 0}
 
 
-def composability(chains, granted):
+def composability(chains, granted, negative=frozenset()):
     rows = []
     for ch in chains:
         needs = ch.get("needs", [])
         missing = [n for n in needs if n not in granted]
+        dead_missing = [n for n in missing if n in negative]
         rows.append({
             "id": ch["id"],
             "tier": ch.get("tier", "info"),
@@ -119,6 +134,7 @@ def composability(chains, granted):
             "case": ch.get("case"),
             "needs": needs,
             "missing": missing,
+            "dead_missing": dead_missing,  # missing needs a probe already killed
             "composable": not missing,
             "note": ch.get("note", ""),
         })
@@ -153,34 +169,131 @@ def tier_name(v):
 
 def cmd_rank(prog, out=sys.stdout):
     _, chains, granted, negative = load_graph(prog)
-    rows = composability(chains, granted)
+    rows = composability(chains, granted, negative)
     items = rank_missing(rows, negative)
+    live = [a for a in items if not a["probed_negative"]]
+    dead = [a for a in items if a["probed_negative"]]
     ncomp = sum(1 for r in rows if r["composable"])
     print(f"# Missing-primitive leverage — {prog}", file=out)
-    print(f"# {len(chains)} chains, {ncomp} composable now. "
+    print(f"# {len(chains)} chains, {ncomp} composable now, {len(dead)} dead-end(s) parked. "
           f"Ranked by (max tier unblocked, actionable-first, #chains).\n", file=out)
     hdr = f"{'CAPABILITY':<46} {'TIER':<9} {'#':<3} {'CLASS':<26} CHAINS"
     print(hdr, file=out)
     print("-" * len(hdr), file=out)
-    for a in items:
-        flag = " [probed-negative]" if a["probed_negative"] else ""
+    for a in live:
         print(f"{a['cap']:<46} {tier_name(a['tier']):<9} {a['n']:<3} "
-              f"{CLS_LABEL[a['class']]:<26} {','.join(a['chains'])}{flag}", file=out)
-    if not items:
-        print("(every chain is composable — go test)", file=out)
+              f"{CLS_LABEL[a['class']]:<26} {','.join(a['chains'])}", file=out)
+    if not live:
+        print("(no live missing primitive — every actionable chain is composable or dead)",
+              file=out)
+    if dead:
+        # A probe already ran these and found the capability ABSENT. Keep them
+        # OUT of the actionable ranking (they are not re-huntable blindly), but
+        # list them so the operator sees the chain is parked, not forgotten.
+        print("\n# dead-ends — probe ran, capability ABSENT; do NOT re-hunt "
+              "(re-open only via a re-arm trigger, see `pihunt-gadgets triggers`)", file=out)
+        for a in dead:
+            print(f"{a['cap']:<46} {tier_name(a['tier']):<9} {a['n']:<3} "
+                  f"{'KILLED (probed negative)':<26} {','.join(a['chains'])}", file=out)
     return items
 
 
 def cmd_chains(prog, out=sys.stdout):
-    _, chains, granted, _ = load_graph(prog)
-    rows = composability(chains, granted)
+    _, chains, granted, negative = load_graph(prog)
+    rows = composability(chains, granted, negative)
     rows.sort(key=lambda r: (r["composable"], -TIERS.get(r["tier"], 0)))
     print(f"# Chain composability — {prog}\n", file=out)
     for r in rows:
-        mark = "COMPOSABLE" if r["composable"] else f"missing: {', '.join(r['missing'])}"
+        if r["composable"]:
+            mark = "COMPOSABLE"
+        elif r["dead_missing"] and len(r["dead_missing"]) == len(r["missing"]):
+            # every remaining need was probed and found absent -> the chain is dead
+            mark = f"DEAD (probed absent: {', '.join(r['dead_missing'])})"
+        else:
+            mark = f"missing: {', '.join(r['missing'])}"
+            if r["dead_missing"]:
+                mark += f" [dead: {', '.join(r['dead_missing'])}]"
         case = f" [{r['case']}]" if r["case"] else ""
         print(f"[{r['tier']:>8}] {r['id']:<18} {r['status']:<14} {mark}{case}", file=out)
     return rows
+
+
+def load_patterns():
+    """Program-agnostic chaining patterns, each sourced to a named practitioner."""
+    path = os.path.join(ROOT, "knowledge", "chaining-patterns.jsonl")
+    pats = [p for p in load_jsonl(path) if p.get("kind") in ("pattern", "principle")]
+    return path, pats
+
+
+def match_patterns(chain_node, pats):
+    """A pattern matches a chain by explicit maps_to / node `pattern` tag, or by a
+    grant_match token being a prefix of one of the chain's granted capabilities."""
+    cid = chain_node["id"]
+    grants = chain_node.get("grants", [])
+    tag = chain_node.get("pattern")
+    hits = []
+    for p in pats:
+        if p.get("kind") != "pattern":
+            continue
+        by_id = cid in p.get("maps_to", []) or (tag and tag == p["id"])
+        by_cap = any(gm and any(g.startswith(gm) or gm in g for g in grants)
+                     for gm in p.get("grant_match", []))
+        if by_id or by_cap:
+            hits.append(p)
+    return hits
+
+
+def _src_line(p):
+    return "; ".join(f"{s['who']} — {s['work']} ({s['year']})"
+                     for s in p.get("sources", []))
+
+
+def cmd_patterns(prog, out=sys.stdout):
+    _, chains, granted, negative = load_graph(prog)
+    rows = {r["id"]: r for r in composability(chains, granted, negative)}
+    ppath, pats = load_patterns()
+    if not pats:
+        print(f"# no chaining-pattern registry at {ppath}", file=out)
+        return []
+
+    def live_state(r):
+        if r["composable"]:
+            return 0  # composable now
+        if r["dead_missing"] and len(r["dead_missing"]) == len(r["missing"]):
+            return 2  # dead
+        return 1      # one probe/gadget away
+
+    print(f"# Chaining patterns — {prog}", file=out)
+    print("# Each chain -> the practitioner pattern it instantiates, the NEXT link "
+          "that pattern\n# predicts, and the source. Composable/actionable first.\n", file=out)
+    order = sorted(chains, key=lambda c: (live_state(rows[c["id"]]),
+                                          -TIERS.get(c.get("tier", "info"), 0)))
+    seen = set()
+    for c in order:
+        if c["id"] in seen:        # a chain can have >1 node (partial + full)
+            continue
+        seen.add(c["id"])
+        r = rows[c["id"]]
+        st = ("COMPOSABLE" if r["composable"] else
+              "DEAD" if live_state(r) == 2 else "needs " + ",".join(r["missing"]))
+        print(f"[{c.get('tier'):>8}] {c['id']:<20} ({st})", file=out)
+        matched = match_patterns(c, pats)
+        if not matched:
+            print("    (no pattern mapped — candidate for a new registry entry)\n", file=out)
+            continue
+        for p in matched:
+            print(f"    ▸ {p['name']}", file=out)
+            print(f"      next: {p['predicts']}", file=out)
+            print(f"      src:  {_src_line(p)}", file=out)
+        print(file=out)
+    principles = [p for p in pats if p.get("kind") == "principle"]
+    if principles:
+        print("# Principles (apply across every surface):", file=out)
+        for p in principles:
+            print(f"    ◆ {p['name']}", file=out)
+            print(f"      {p['predicts']}", file=out)
+            print(f"      src:  {_src_line(p)}", file=out)
+    return pats
 
 
 def eval_triggers(prog):
@@ -212,6 +325,54 @@ def cmd_triggers(prog, out=sys.stdout):
     return armed, waiting
 
 
+def cmd_suggest(prog, out=sys.stdout):
+    """The single best next action: top LIVE actionable primitive + the pattern it
+    instantiates + the next link that pattern predicts + a paste-ready launch line."""
+    _, chains, granted, negative = load_graph(prog)
+    rows = composability(chains, granted, negative)
+    items = rank_missing(rows, negative)
+    live = [a for a in items if not a["probed_negative"]]
+    actionable = [a for a in live if a["class"] == "probe"]
+    pick = actionable or live
+    _, pats = load_patterns()
+    print(f"# Suggested next action — {prog}\n", file=out)
+    if not pick:
+        armed, _ = eval_triggers(prog)
+        if armed:
+            print("No live actionable primitive, but a re-arm trigger is ARMED:", file=out)
+            for t in armed:
+                print(f"  ★ {t['id']} (cap {t['when_capability']}) -> "
+                      f"{t.get('action','')}", file=out)
+        else:
+            print("No live actionable primitive and no armed trigger. Either every chain "
+                  "is composable (go test) or the frontier needs a DISCOVER gadget from "
+                  "recon — see `pihunt-gadgets rank`.", file=out)
+        return
+    top = pick[0]
+    chs = top["chains"]
+    print(f"Top primitive : {top['cap']}  ({tier_name(top['tier'])}, "
+          f"{CLS_LABEL[top['class']]})", file=out)
+    print(f"Unblocks      : {', '.join(chs)}", file=out)
+    seen = set()
+    for c in [c for c in chains if c["id"] in chs]:
+        if c["id"] in seen:
+            continue
+        seen.add(c["id"])
+        hit = match_patterns(c, pats)
+        if hit:
+            p = hit[0]
+            print(f"Pattern       : {p['name']}", file=out)
+            print(f"Next link     : {p['predicts']}", file=out)
+            print(f"Source        : {_src_line(p)}", file=out)
+        break
+    print("\nLaunch line (adjust floor/endpoint from `pihunt-authz gaps`):", file=out)
+    print(f"  Hunt {prog} in Intigriti for CRITICAL. Start on {chs[0]} "
+          f"({top['cap']}): authz-differential across both OWN teams (A->B, B->A, "
+          f"unauth), sweep sibling verbs, confirm or kill, write the node to "
+          f"gadget-graph.jsonl.", file=out)
+    return top
+
+
 def cmd_check(prog):
     armed, _ = eval_triggers(prog)
     if armed:
@@ -236,7 +397,10 @@ def cmd_report(prog):
               "discover-class rows wait on an external gadget recon must find.\n\n")
     buf.write("## 2. Chain composability\n\n```\n")
     cmd_chains(prog, out=buf)
-    buf.write("```\n\n## 3. Re-arm triggers\n\n```\n")
+    buf.write("```\n\n## 3. Chaining patterns (what a decent hunter does next)\n\n```\n")
+    cmd_patterns(prog, out=buf)
+    buf.write("```\n\n> Patterns + sources: `knowledge/chaining-patterns.jsonl`.\n\n")
+    buf.write("## 4. Re-arm triggers\n\n```\n")
     cmd_triggers(prog, out=buf)
     buf.write("```\n")
     with open(path, "w") as f:
@@ -254,6 +418,10 @@ def main(argv):
         cmd_rank(prog)
     elif cmd == "chains":
         cmd_chains(prog)
+    elif cmd == "patterns":
+        cmd_patterns(prog)
+    elif cmd == "suggest":
+        cmd_suggest(prog)
     elif cmd == "triggers":
         cmd_triggers(prog)
     elif cmd == "check":

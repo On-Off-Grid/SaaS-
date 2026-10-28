@@ -89,8 +89,4 @@ pi-tier on
 
 # Change just the coordinator (state file read by pi-hunt)
 pi-tier set-coordinator amd-radeon/DeepSeek-V4.1-Flash:high
-
-# Legacy Kimi-only quality toggle; does not touch DeepSeek/Mistral agents
-pi-4.8 status
-pi-4.8 on|off
 ```

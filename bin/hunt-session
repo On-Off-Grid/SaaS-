@@ -6,8 +6,11 @@
 # teardown is a one-liner. Nothing here is new capability — it is the *order* and
 # the *reasoning*, captured so it is reproducible and not re-derived each time.
 #
+#   hunt-session brief       read-only orientation + suggested next action (the default;
+#                            delegates to hunt-brief; also written to SESSION-BRIEF.md)
 #   hunt-session preflight   read-only: stale procs + watcher pidfiles + live quotas
-#   hunt-session up          clear stale state -> tier on -> size concurrency -> watchers
+#   hunt-session up          clear stale state -> tier on -> size concurrency (advises watchers)
+#   hunt-session watchers    start the five failover/safety watchers (background)
 #   hunt-session steer       the synthesis snapshot: where to spend budget right now
 #   hunt-session status      compact "what's running + current quota" view
 #   hunt-session down        stop all watchers, clear pidfiles (clean teardown)
@@ -69,13 +72,10 @@ cmd_up(){
   clear_stale_pidfiles
   pi-tier on                 # mechanical->Mistral, hunters+coord->AMD DeepSeek, elite->Kimi
   pi-tier concurrency once    # size PI_SUBAGENT_MAX_CONCURRENCY from providers up RIGHT NOW
-  c_hdr "start failover + safety watchers"
-  pi-tier hybrid watch 300 &        # elite pair Kimi<->AMD on Kimi's 5h window
-  pi-tier amd-fallback watch 300 &  # AMD $1/day cap -> OpenRouter, back on reset
-  pi-tier coord-health watch 120 &  # coordinator provider down -> stage healthy fallback
-  pi-tier concurrency watch 300 &   # keep concurrency sized as providers flap
-  pi-tier stall-watch watch 120 &   # ring the desk if the hunt goes idle/hung
-  sleep 1
+  c_hdr "advised: start the failover + safety watchers"
+  echo "  idempotent config is applied above. Watchers are background daemons, so"
+  echo "  they are NOT auto-started — run them when you commit to the hunt:"
+  echo "    hunt-session watchers        # starts all five in the right order"
   c_hdr "next"
   echo "  re-source the env in a FRESH shell so concurrency applies at launch:"
   echo "    source ~/.pi/secrets/pihunt-tuning.env"
@@ -83,6 +83,20 @@ cmd_up(){
   echo "    pi-hunt"
   echo "    > Hunt $PROG in Intigriti for CRITICAL/EXCEPTIONAL"
 }
+
+cmd_watchers(){
+  c_hdr "start failover + safety watchers"
+  clear_stale_pidfiles
+  pi-tier hybrid watch 300 &        # elite pair Kimi<->AMD on Kimi's 5h window
+  pi-tier amd-fallback watch 300 &  # AMD $1/day cap -> OpenRouter, back on reset
+  pi-tier coord-health watch 120 &  # coordinator provider down -> stage healthy fallback
+  pi-tier concurrency watch 300 &   # keep concurrency sized as providers flap
+  pi-tier stall-watch watch 120 &   # ring the desk if the hunt goes idle/hung
+  sleep 1
+  cmd_status
+}
+
+cmd_brief(){ hunt-brief "$@"; }
 
 cmd_steer(){
   c_hdr "where to spend budget (gadget graph)"; pihunt-gadgets rank --program "$PROG"
@@ -110,11 +124,13 @@ cmd_down(){
   echo "watchers stopped. (a running pi coordinator, if any, is left alone — stop it in its TUI.)"
 }
 
-case "${1:-preflight}" in
+case "${1:-brief}" in
+  brief|b)       shift; cmd_brief "$@" ;;
   preflight|pre) cmd_preflight ;;
   up|start)      cmd_up ;;
+  watchers|arm)  cmd_watchers ;;
   steer)         cmd_steer ;;
   status)        cmd_status ;;
   down|stop)     cmd_down ;;
-  *) echo "usage: hunt-session {preflight|up|steer|status|down}"; exit 2 ;;
+  *) echo "usage: hunt-session {brief|preflight|up|watchers|steer|status|down}"; exit 2 ;;
 esac
