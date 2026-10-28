@@ -71,14 +71,21 @@ Refs are `provider/model[:thinking]` and must exist in `~/.pi/agent/models.json`
 **Effect applies to NEW spawns**; a coordinator change applies at next launch, elite at next subagent spawn.
 
 ### Auto-failover watchers — start these alongside a long hunt
-> One-liner: **`hunt-session watchers`** starts all five in order. The individual
+> One-liner: **`hunt-session watchers`** starts all six in order. The individual
 > `pi-tier … watch` primitives it runs, if you want just one:
 ```bash
 pi-tier hybrid watch 300 &        # elite pair Kimi<->AMD on Kimi's 5h quota window
 pi-tier amd-fallback watch 300 &  # AMD $1/day cap -> OpenRouter, back on reset
+pi-tier groq-fallback watch 300 & # Groq free-tier (Qwen) 429/down -> OpenRouter, back on recovery
 pi-tier coord-health watch 120 &  # coordinator provider down -> stage healthy fallback
 pi-tier concurrency watch 300 &   # scale PI_SUBAGENT_MAX_CONCURRENCY to # providers up
-pi-tier stall-watch watch 120 &   # ring the desk if the hunt goes idle/hung (NEW)
+pi-tier stall-watch watch 120 &   # ring the desk if the hunt goes idle/hung
+```
+**Stop the watchers** (they run in the background until stopped):
+```bash
+hunt-session down                 # stops ALL of them + clears pidfiles (safe to re-run)
+pi-tier groq-fallback off         # or stop just one by name
+hunt-session status               # show which watchers are currently up
 ```
 
 **concurrency** scaling: sets `PI_SUBAGENT_MAX_CONCURRENCY` in `pihunt-tuning.env` from how many
@@ -204,7 +211,7 @@ pihunt-gadgets rank && pihunt-authz gaps
 
 # 2. set routing + start the safety watchers for a long run
 hunt-session up           # apply tiering + size concurrency to live quota (advises watchers)
-hunt-session watchers     # start all five failover/safety watchers
+hunt-session watchers     # start all six failover/safety watchers (stop: hunt-session down)
 
 # 3. launch the hunt (you drive the TUI) aimed at the top-ranked targets
 pi-hunt "Hunt digitalocean for CRITICAL"

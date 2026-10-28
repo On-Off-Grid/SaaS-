@@ -25,7 +25,7 @@ dives are linked at the end; this page is the routine.
 # BEFORE
 hunt-session brief            # read-only: last state + suggested next action + live quota
 hunt-session up               # apply tiering + size concurrency to live quota (advises watchers)
-hunt-session watchers         # start the five failover/safety watchers (background)
+hunt-session watchers         # start the six failover/safety watchers (background)
 #   source ~/.pi/secrets/pihunt-tuning.env ; open a fresh shell so concurrency applies
 
 # LAUNCH
@@ -36,6 +36,12 @@ pi-hunt
 #   update gadget-graph.jsonl (confirm/kill) → submit by hand → record the outcome:
 bin/pihunt-triage record <case> --severity <s> --gadget <g> ; # … submit …
 bin/pihunt-triage verdict <case> <accepted|duplicate|…> [--bounty N] ; bin/pihunt-triage sync
+
+# TEARDOWN (stop the background watchers started by `hunt-session watchers`)
+hunt-session down             # stops ALL watchers + clears pidfiles (safe to re-run)
+#   or stop just one:  pi-tier <name> off
+#   names: hybrid amd-fallback groq-fallback coord-health concurrency stall-watch
+#   see what's running:  hunt-session status
 ```
 
 ---
@@ -75,12 +81,14 @@ bin/pihunt-triage verdict <case> <accepted|duplicate|…> [--bounty N] ; bin/pih
    `pihunt-tuning.env` or open a new shell, then launch. `pi-tier concurrency
    status` shows live (running pi) vs file value.
 3. **Start the safety watchers** (run alongside a long hunt) — one wrapper starts all
-   five in the right order (hybrid, amd-fallback, coord-health, concurrency, stall-watch):
+   six in the right order (hybrid, amd-fallback, groq-fallback, coord-health,
+   concurrency, stall-watch):
    ```bash
    hunt-session watchers
    ```
-   (The underlying `pi-tier <name> watch` primitives are in the tooling cheatsheet if
-   you want to start one individually.)
+   **Stop them** with `hunt-session down` (all, + clears pidfiles) or `pi-tier <name> off`
+   for one; `hunt-session status` shows which are up. The underlying `pi-tier <name>
+   watch` primitives are in the tooling cheatsheet if you want to start one individually.
 4. **Aim the fleet with the recon synthesis** (the habit that avoids re-hunting
    the hardened core):
    ```bash

@@ -10,7 +10,8 @@
 #                            delegates to hunt-brief; also written to SESSION-BRIEF.md)
 #   hunt-session preflight   read-only: stale procs + watcher pidfiles + live quotas
 #   hunt-session up          clear stale state -> tier on -> size concurrency (advises watchers)
-#   hunt-session watchers    start the five failover/safety watchers (background)
+#   hunt-session watchers    start the six failover/safety watchers (background)
+#                            (stop them all again with `hunt-session down`)
 #   hunt-session steer       the synthesis snapshot: where to spend budget right now
 #   hunt-session status      compact "what's running + current quota" view
 #   hunt-session down        stop all watchers, clear pidfiles (clean teardown)
@@ -33,7 +34,7 @@ export PATH="$HOME/.local/bin:$REPO/bin:$PATH"
 PROG="${PIHUNT_PROGRAM:-digitalocean}"
 export PIHUNT_CASEFILE="$REPO/.pi/casefile.jsonl"
 PIDDIR="$HOME/.pi/agent"
-WATCHERS=(hybrid amdfb coordh concwatch stallwatch)   # pidfile basenames
+WATCHERS=(hybrid amdfb groqfb coordh concwatch stallwatch)   # pidfile basenames
 
 c_hdr(){ printf '\n\033[1;36m==== %s ====\033[0m\n' "$*"; }
 
@@ -65,6 +66,7 @@ cmd_preflight(){
   echo; pi-tier coord-health status
   echo; pi-tier hybrid status
   echo; pi-tier amd-fallback status
+  echo; pi-tier groq-fallback status
 }
 
 cmd_up(){
@@ -75,7 +77,8 @@ cmd_up(){
   c_hdr "advised: start the failover + safety watchers"
   echo "  idempotent config is applied above. Watchers are background daemons, so"
   echo "  they are NOT auto-started — run them when you commit to the hunt:"
-  echo "    hunt-session watchers        # starts all five in the right order"
+  echo "    hunt-session watchers        # starts all six in the right order"
+  echo "    hunt-session down            # stops them all again (clean teardown)"
   c_hdr "next"
   echo "  re-source the env in a FRESH shell so concurrency applies at launch:"
   echo "    source ~/.pi/secrets/pihunt-tuning.env"
@@ -89,11 +92,16 @@ cmd_watchers(){
   clear_stale_pidfiles
   pi-tier hybrid watch 300 &        # elite pair Kimi<->AMD on Kimi's 5h window
   pi-tier amd-fallback watch 300 &  # AMD $1/day cap -> OpenRouter, back on reset
+  pi-tier groq-fallback watch 300 & # Groq free-tier (Qwen) 429/down -> OpenRouter, back on recovery
   pi-tier coord-health watch 120 &  # coordinator provider down -> stage healthy fallback
   pi-tier concurrency watch 300 &   # keep concurrency sized as providers flap
   pi-tier stall-watch watch 120 &   # ring the desk if the hunt goes idle/hung
   sleep 1
   cmd_status
+  c_hdr "to stop"
+  echo "  all:  hunt-session down            # stops every watcher + clears pidfiles"
+  echo "  one:  pi-tier <name> off           # e.g. pi-tier groq-fallback off"
+  echo "        (names: hybrid amd-fallback groq-fallback coord-health concurrency stall-watch)"
 }
 
 cmd_brief(){ hunt-brief "$@"; }
@@ -119,7 +127,7 @@ cmd_status(){
 
 cmd_down(){
   c_hdr "teardown"
-  for sub in hybrid amd-fallback coord-health concurrency stall-watch; do pi-tier "$sub" off; done
+  for sub in hybrid amd-fallback groq-fallback coord-health concurrency stall-watch; do pi-tier "$sub" off; done
   clear_stale_pidfiles
   echo "watchers stopped. (a running pi coordinator, if any, is left alone — stop it in its TUI.)"
 }
