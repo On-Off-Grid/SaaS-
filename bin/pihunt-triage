@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""pihunt-triage — close the loop from a submission to the program triager's verdict.
+
+The gadget graph tracks TECHNICAL status (confirmed/negative/blocked). It does not
+know what the PROGRAM decided. This tool records each submission and the triager's
+verdict (accepted / duplicate / informative / out-of-scope / ...), then feeds that
+verdict back into the gadget graph as a directive so the next hunt spends budget
+where findings actually convert.
+
+Ledger: reports/<prog>/structured-recon/submissions.jsonl  (one event per line,
+last-wins by case). Events: kind=submission (a report was sent) and kind=verdict
+(the triager decided). `sync` writes kind=triage annotations into gadget-graph.jsonl.
+
+Verdict -> graph directive
+  accepted        gadget stays confirmed, outcome=accepted; SWEEP the sibling
+                  verbs/resources of this gadget class (proven to convert).
+  duplicate       capability is REAL but already known; keep confirmed, novelty=low;
+                  pivot to a DIFFERENT impact/escalation of the same capability.
+  informative     capability exists but is below the program's bar; downgrade the
+  not_applicable  expected tier for this class; stop spending CRITICAL-floor budget
+  wont_fix        hunting it.
+  out_of_scope    add a scope exclusion; flip related probe(s) to scope_excluded;
+                  never re-hunt.
+  resolved        re-arm: re-probe after the fix to confirm closure / catch regression.
+  spam            likely a false-positive gadget; review, consider flipping to negative.
+
+Usage:
+  pihunt-triage record  <case> [--platform P --severity S --cvss V --weakness W
+                                --gadget G (repeatable) --chain C --draft ID
+                                --report PATH --title T]
+  pihunt-triage verdict <case> <accepted|duplicate|informative|not_applicable|
+                                out_of_scope|wont_fix|resolved|spam>
+                                [--bounty N --tier T --dupof URL --note "..."]
+  pihunt-triage list    [--program P]          one line per submission + latest verdict
+  pihunt-triage report  [--program P]          write structured-recon/submissions-report.md
+  pihunt-triage sync    [--program P] [--apply] feed verdicts into gadget-graph.jsonl
+                                                (annotate; --apply also mutates gadget
+                                                 status for out_of_scope/spam)
+Default program: digitalocean (or $PIHUNT_PROGRAM). Reads/writes only graph+ledger; no creds.
+"""
+import json
+import os
+import sys
+import datetime
+
+VERDICTS = {
+    "accepted":       ("confirmed", "SWEEP sibling verbs/resources of this gadget class (proven to convert)."),
+    "duplicate":      ("confirmed", "Capability real but known; novelty=low. Pivot to a different impact/escalation of the same capability."),
+    "informative":    ("low",       "Below program bar; downgrade expected tier for this class; stop spending CRITICAL-floor budget on it."),
+    "not_applicable": ("low",       "Program N/A; downgrade expected tier; de-prioritise this class."),
+    "wont_fix":       ("low",       "Accepted-risk; downgrade expected tier; de-prioritise re-reporting."),
+    "out_of_scope":   ("scope_excluded", "Add scope exclusion; flip related probe(s) to scope_excluded; never re-hunt."),
+    "resolved":       ("confirmed", "Re-arm: re-probe after the fix to confirm closure / catch regression."),
+    "spam":           ("review",    "Likely false-positive gadget; review, consider flipping to negative."),
+}
+TIER_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0, "": -1}
+
+
+def _find_root():
+    d = os.getcwd()
+    while True:
+        if os.path.isdir(os.path.join(d, "reports")):
+            return d
+        p = os.path.dirname(d)
+        if p == d:
+            return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        d = p
+
+
+ROOT = _find_root()
+
+
+def program(argv):
+    for i, a in enumerate(argv):
+        if a == "--program" and i + 1 < len(argv):
+            return argv[i + 1]
+    return os.environ.get("PIHUNT_PROGRAM", "digitalocean")
+
+
+def recon_dir(prog):
+    return os.path.join(ROOT, "reports", prog, "structured-recon")
+
+
+def subs_path(prog):
+    return os.path.join(recon_dir(prog), "submissions.jsonl")
+
+
+def graph_path(prog):
+    return os.path.join(recon_dir(prog), "gadget-graph.jsonl")
+
+
+def load_jsonl(path):
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path) as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                out.append(json.loads(ln))
+            except json.JSONDecodeError as e:
+                sys.stderr.write(f"warn: bad line in {path}: {e}\n")
+    return out
+
+
+def opt(argv, name, default=None):
+    for i, a in enumerate(argv):
+        if a == name and i + 1 < len(argv):
+            return argv[i + 1]
+    return default
+
+
+def opts_multi(argv, name):
+    return [argv[i + 1] for i, a in enumerate(argv) if a == name and i + 1 < len(argv)]
+
+
+def today():
+    return os.environ.get("PIHUNT_TODAY") or datetime.date.today().isoformat()
+
+
+def append(path, obj):
+    with open(path, "a") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def state(prog):
+    """Collapse the ledger to the latest state per case: submission + latest verdict."""
+    subs, verdicts = {}, {}
+    for e in load_jsonl(subs_path(prog)):
+        k = e.get("kind")
+        if k == "submission" and e.get("case"):
+            subs[e["case"]] = e
+        elif k == "verdict" and e.get("case"):
+            verdicts[e["case"]] = e
+    return subs, verdicts
+
+
+def ensure_ledger(prog):
+    p = subs_path(prog)
+    if not os.path.exists(p):
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        append(p, {"kind": "meta", "schema": 1, "program": prog,
+                   "note": "Submission ledger. kind=submission|verdict, last-wins by case. "
+                           "`pihunt-triage sync` feeds verdicts into gadget-graph.jsonl."})
+    return p
+
+
+def cmd_record(prog, argv):
+    case = argv[0] if argv and not argv[0].startswith("-") else None
+    if not case:
+        sys.exit("usage: pihunt-triage record <case> [--platform ... --gadget G ...]")
+    p = ensure_ledger(prog)
+    ev = {"kind": "submission", "case": case,
+          "title": opt(argv, "--title", ""),
+          "platform": opt(argv, "--platform", "intigriti"),
+          "program": prog,
+          "submittedAt": today(),
+          "severityClaimed": opt(argv, "--severity", ""),
+          "cvss": opt(argv, "--cvss", ""),
+          "weakness": opt(argv, "--weakness", ""),
+          "gadgets": opts_multi(argv, "--gadget"),
+          "chains": opts_multi(argv, "--chain"),
+          "draftId": opt(argv, "--draft", ""),
+          "reportPath": opt(argv, "--report", ""),
+          "triage": "pending"}
+    append(p, ev)
+    print(f"recorded submission {case} ({ev['severityClaimed'] or '?'}) -> {p}")
+
+
+def cmd_verdict(prog, argv):
+    if len(argv) < 2 or argv[1] not in VERDICTS:
+        sys.exit("usage: pihunt-triage verdict <case> <%s> [--bounty N --tier T --note ...]"
+                 % "|".join(VERDICTS))
+    case, verdict = argv[0], argv[1]
+    p = ensure_ledger(prog)
+    ev = {"kind": "verdict", "case": case, "verdict": verdict, "decidedAt": today(),
+          "bounty": opt(argv, "--bounty"), "tierActual": opt(argv, "--tier"),
+          "dupOf": opt(argv, "--dupof"), "note": opt(argv, "--note", "")}
+    append(p, ev)
+    _, directive = VERDICTS[verdict]
+    print(f"verdict {case} = {verdict}. directive: {directive}")
+    print("run `pihunt-triage sync` to feed it into the gadget graph.")
+
+
+def _fmt_money(v):
+    return f"${v}" if v not in (None, "") else "-"
+
+
+def cmd_list(prog, _argv):
+    subs, verdicts = state(prog)
+    if not subs:
+        print("no submissions recorded. use `pihunt-triage record <case>`.")
+        return
+    for case, s in sorted(subs.items(), key=lambda kv: kv[1].get("submittedAt", "")):
+        v = verdicts.get(case)
+        vs = v["verdict"] if v else "pending"
+        extra = f"  bounty={_fmt_money(v.get('bounty'))}" if v else ""
+        print(f"  {s.get('submittedAt','?'):10} {case}  [{s.get('severityClaimed','?'):6}] "
+              f"-> {vs}{extra}  {s.get('title','')[:50]}")
+
+
+def cmd_report(prog, _argv):
+    subs, verdicts = state(prog)
+    out = [f"# Submissions & triage — {prog}", "",
+           f"Generated by `pihunt-triage report`. {len(subs)} submission(s).", ""]
+    n = len(subs)
+    decided = {c: verdicts[c] for c in subs if c in verdicts}
+    counts = {}
+    bounty = 0.0
+    for v in decided.values():
+        counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+        try:
+            bounty += float(v.get("bounty") or 0)
+        except ValueError:
+            pass
+    acc = counts.get("accepted", 0)
+    out += ["## Scoreboard",
+            f"- submitted: **{n}**   decided: **{len(decided)}**   pending: **{n-len(decided)}**",
+            f"- accepted: **{acc}**" + (f"  ({acc*100//len(decided)}% of decided)" if decided else ""),
+            f"- duplicate: {counts.get('duplicate',0)}   informative/NA/wontfix: "
+            f"{counts.get('informative',0)+counts.get('not_applicable',0)+counts.get('wont_fix',0)}   "
+            f"out-of-scope: {counts.get('out_of_scope',0)}   resolved: {counts.get('resolved',0)}",
+            f"- total bounty: **${bounty:.0f}**", ""]
+    out += ["## Per submission", "",
+            "| submitted | case | sev | verdict | bounty | directive |",
+            "|---|---|---|---|---|---|"]
+    for case, s in sorted(subs.items(), key=lambda kv: kv[1].get("submittedAt", "")):
+        v = verdicts.get(case)
+        vs = v["verdict"] if v else "pending"
+        directive = VERDICTS[vs][1] if vs in VERDICTS else "awaiting triage"
+        out.append(f"| {s.get('submittedAt','?')} | {case} | {s.get('severityClaimed','?')} | "
+                   f"{vs} | {_fmt_money(v.get('bounty') if v else None)} | {directive} |")
+    out += ["", "## Graph feedback pending `sync`",
+            "Run `pihunt-triage sync` to write these directives into gadget-graph.jsonl "
+            "(kind=triage) so `pihunt-gadgets rank` can weight them.", ""]
+    path = os.path.join(recon_dir(prog), "submissions-report.md")
+    open(path, "w").write("\n".join(out) + "\n")
+    print(f"wrote {path}")
+
+
+def cmd_sync(prog, argv):
+    apply = "--apply" in argv
+    subs, verdicts = state(prog)
+    gpath = graph_path(prog)
+    existing = load_jsonl(gpath)
+    have = {(n.get("case"), n.get("verdict")) for n in existing if n.get("kind") == "triage"}
+    glines = open(gpath).read().splitlines() if os.path.exists(gpath) else []
+    wrote = 0
+    mutated = 0
+    for case, v in verdicts.items():
+        verdict = v["verdict"]
+        gadgets = subs.get(case, {}).get("gadgets", [])
+        chains = subs.get(case, {}).get("chains", [])
+        target_status, directive = VERDICTS[verdict]
+        if (case, verdict) not in have:
+            ann = {"kind": "triage", "case": case, "verdict": verdict,
+                   "gadgets": gadgets, "chains": chains, "directive": directive,
+                   "tierActual": v.get("tierActual"), "bounty": v.get("bounty"),
+                   "date": v.get("decidedAt", today())}
+            glines.append(json.dumps(ann, ensure_ascii=False))
+            wrote += 1
+            print(f"+ triage annotation: {case} = {verdict} -> gadgets {gadgets or '[]'}")
+            print(f"    directive: {directive}")
+        # Optional hard mutation for unambiguous adverse verdicts.
+        if apply and target_status in ("scope_excluded", "review"):
+            for i, ln in enumerate(glines):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    d = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("kind") == "gadget" and d.get("id") in gadgets:
+                    d["triageStatus"] = target_status
+                    d["triageVerdict"] = verdict
+                    glines[i] = json.dumps(d, ensure_ascii=False)
+                    mutated += 1
+    if wrote or mutated:
+        open(gpath, "w").write("\n".join(glines) + "\n")
+    print(f"sync: {wrote} annotation(s) written, {mutated} gadget node(s) mutated"
+          f"{' (--apply)' if apply else ' (dry graph status, use --apply to mutate)'}.")
+    if not verdicts:
+        print("  (no verdicts yet — record them with `pihunt-triage verdict <case> <verdict>`.)")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    prog = program(rest)
+    rest = [a for i, a in enumerate(rest)
+            if a != "--program" and (i == 0 or rest[i - 1] != "--program")]
+    if cmd == "record":
+        cmd_record(prog, rest)
+    elif cmd == "verdict":
+        cmd_verdict(prog, rest)
+    elif cmd == "list":
+        cmd_list(prog, rest)
+    elif cmd == "report":
+        cmd_report(prog, rest)
+    elif cmd == "sync":
+        cmd_sync(prog, rest)
+    else:
+        sys.exit(f"unknown command: {cmd} (see --help)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
