@@ -27,6 +27,8 @@ hunt-session brief            # read-only: last state + suggested next action + 
 hunt-session up               # apply tiering + size concurrency to live quota (advises watchers)
 hunt-session watchers         # start the six failover/safety watchers (background)
 #   source ~/.pi/secrets/pihunt-tuning.env ; open a fresh shell so concurrency applies
+#   (provider API keys must be in the env too — install.sh wires the rc to source them;
+#    if pi says "No API key found for <provider>": . ~/.pi/secrets/<provider>.env)
 
 # LAUNCH
 pi-hunt
@@ -69,9 +71,15 @@ hunt-session down             # stops ALL watchers + clears pidfiles (safe to re
 
 ## 2. BEFORE the hunt — configure & aim
 
-1. **Providers up?** Keys in the three `*.env`; `pi-tier status` shows per-agent
+1. **Providers up?** Keys live in `~/.pi/secrets/*.env`; `pi-tier status` shows per-agent
    models + which refs resolve. `pi-tier coord-health status` probes the
    coordinator's provider (its being down is the classic silent freeze).
+   **Provider keys must be in the shell env** — pi reads `$OPENROUTER_API_KEY`,
+   `$RADEON_API_KEY`, `$GROQ_API_KEY`, `$MISTRAL_API_KEY`, … from the environment.
+   `install.sh` adds a managed block to your shell rc that sources
+   `~/.pi/secrets/{openrouter,amd,groq,cerebras,kimi,direct_llm}.env` (open a fresh
+   shell after install). If pi ever errors **"No API key found for `<provider>`"**, that
+   provider's env file isn't sourced — fix now with `. ~/.pi/secrets/<provider>.env`.
 2. **Apply tiering & concurrency:**
    ```bash
    pi-tier on                     # mechanical/hunters/elite mapping

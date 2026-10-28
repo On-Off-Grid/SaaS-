@@ -164,6 +164,29 @@ if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/nu
   run "loginctl enable-linger '$USER_NAME'" && ok "linger enabled"
 else warn "systemd --user unavailable. The optional recon/cve timers were not enabled."; fi
 
+c "6c/7  shell env  ->  source LLM provider keys for pi"
+# pi reads provider API keys from the ENVIRONMENT ($OPENROUTER_API_KEY, $RADEON_API_KEY,
+# $GROQ_API_KEY, $MISTRAL_API_KEY, …). The keys live in ~/.pi/secrets/*.env but a shell
+# only has them if its rc sources them — otherwise pi fails with "No API key found for
+# <provider>" (classically openrouter, the coordinator). Add ONE idempotent managed block
+# to the login shell's rc so every new shell (and interactive pi-hunt) sees them.
+case "$(basename "${SHELL:-sh}")" in
+  zsh)  RC="$H/.zshrc" ;;
+  bash) RC="$H/.bashrc" ;;
+  *)    RC="$H/.profile" ;;
+esac
+PKMARK="# >>> pi-hunt provider keys >>>"
+if [ "$DRY" = 1 ]; then printf '   [dry] ensure provider-key sourcing block in %s\n' "$RC"
+elif grep -qF "$PKMARK" "$RC" 2>/dev/null; then ok "provider-key sourcing already present in $(basename "$RC")"
+else
+  { printf '\n%s\n' "$PKMARK"
+    printf '%s\n' "# Source the LLM provider keys pi reads from env (managed by install.sh; safe to re-source)."
+    printf '%s\n' 'for __pk in openrouter amd groq cerebras kimi direct_llm; do [ -f "$HOME/.pi/secrets/$__pk.env" ] && . "$HOME/.pi/secrets/$__pk.env"; done; unset __pk'
+    printf '%s\n' "# <<< pi-hunt provider keys <<<"
+  } >> "$RC" && ok "added provider-key sourcing to $(basename "$RC") — open a new shell or 'source $RC'" \
+    || warn "could not append provider-key sourcing to $RC (add it by hand; see docs/operator/OPERATOR-GUIDE.md §2)"
+fi
+
 c "7/7  verify"
 # Offline self-test of the force-multiplier logic (ensemble/swarm builders, MCP
 # profiles, RAM gate, depth cap, retry classification). No model calls.
