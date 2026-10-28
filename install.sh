@@ -95,9 +95,17 @@ npmdeps "$CDT"
 # medium-rss-mcp -> ~/opencode/medium-rss-mcp
 run "mkdir -p '$H/opencode/medium-rss-mcp'"
 run "cp -p '$SRC/mcp-servers/medium-rss-mcp/server.mjs' '$H/opencode/medium-rss-mcp/'" && ok "medium-rss-mcp (no deps)"
-# burp proxy jar -> ~/.BurpSuite/mcp-proxy
+# burp proxy jar -> ~/.BurpSuite/mcp-proxy (LEGACY stdio bridge; the default runtime
+# talks to Burp's MCP SSE server directly. 13MB third-party jar, not bundled — best-effort.)
 run "mkdir -p '$H/.BurpSuite/mcp-proxy'"
-run "cp -p '$SRC/mcp-servers/burp-mcp-proxy/mcp-proxy-all.jar' '$H/.BurpSuite/mcp-proxy/'" && ok "burp mcp-proxy jar (needs Burp app + AI-Agent ext on :9876)"
+BURP_JAR="$SRC/mcp-servers/burp-mcp-proxy/mcp-proxy-all.jar"
+if [ -f "$BURP_JAR" ]; then
+  run "cp -p '$BURP_JAR' '$H/.BurpSuite/mcp-proxy/'" && ok "burp mcp-proxy jar -> ~/.BurpSuite/mcp-proxy (stdio bridge; needs Burp + AI-Agent ext on :9876)"
+elif [ -f "$H/.BurpSuite/mcp-proxy/mcp-proxy-all.jar" ]; then
+  ok "burp mcp-proxy jar already present (not bundled; kept existing)"
+else
+  warn "burp mcp-proxy jar not bundled (13MB legacy stdio bridge) and none installed — see mcp-servers/burp-mcp-proxy/README.md. Optional: the default runtime uses Burp's SSE server directly."
+fi
 # memory data -> ~/.config/opencode/memory (don't clobber an existing graph)
 run "mkdir -p '$H/.config/opencode/memory'"
 if [ "$DRY" = 0 ] && [ ! -f "$H/.config/opencode/memory/memory.jsonl" ]; then
