@@ -95,9 +95,17 @@ npmdeps "$CDT"
 # medium-rss-mcp -> ~/opencode/medium-rss-mcp
 run "mkdir -p '$H/opencode/medium-rss-mcp'"
 run "cp -p '$SRC/mcp-servers/medium-rss-mcp/server.mjs' '$H/opencode/medium-rss-mcp/'" && ok "medium-rss-mcp (no deps)"
-# burp proxy jar -> ~/.BurpSuite/mcp-proxy
+# burp proxy jar -> ~/.BurpSuite/mcp-proxy (LEGACY stdio bridge; the default runtime
+# talks to Burp's MCP SSE server directly. 13MB third-party jar, not bundled — best-effort.)
 run "mkdir -p '$H/.BurpSuite/mcp-proxy'"
-run "cp -p '$SRC/mcp-servers/burp-mcp-proxy/mcp-proxy-all.jar' '$H/.BurpSuite/mcp-proxy/'" && ok "burp mcp-proxy jar (needs Burp app + AI-Agent ext on :9876)"
+BURP_JAR="$SRC/mcp-servers/burp-mcp-proxy/mcp-proxy-all.jar"
+if [ -f "$BURP_JAR" ]; then
+  run "cp -p '$BURP_JAR' '$H/.BurpSuite/mcp-proxy/'" && ok "burp mcp-proxy jar -> ~/.BurpSuite/mcp-proxy (stdio bridge; needs Burp + AI-Agent ext on :9876)"
+elif [ -f "$H/.BurpSuite/mcp-proxy/mcp-proxy-all.jar" ]; then
+  ok "burp mcp-proxy jar already present (not bundled; kept existing)"
+else
+  warn "burp mcp-proxy jar not bundled (13MB legacy stdio bridge) and none installed — see mcp-servers/burp-mcp-proxy/README.md. Optional: the default runtime uses Burp's SSE server directly."
+fi
 # memory data -> ~/.config/opencode/memory (don't clobber an existing graph)
 run "mkdir -p '$H/.config/opencode/memory'"
 if [ "$DRY" = 0 ] && [ ! -f "$H/.config/opencode/memory/memory.jsonl" ]; then
@@ -119,8 +127,8 @@ else warn "rag/install-rag.sh not bundled — skipping RAG"; fi
 
 c "6/7  launchers  ->  $H/.local/bin"
 run "mkdir -p '$H/.local/bin'"
-for l in pi-hunt pi-4.8 pi-tier pihunt-gadgets pihunt-authz pihunt-triage hunt-session submission-shots; do [ -f "$SRC/bin/$l" ] || continue; bk "$H/.local/bin/$l"; run "cp -p '$SRC/bin/$l' '$H/.local/bin/$l'"; rehome "$H/.local/bin/$l"; run "chmod +x '$H/.local/bin/$l'"; done
-ok "pi-hunt (Kimi Code), pi-4.8 (flagship toggle), pi-tier (cost tiering)"
+for l in pi-hunt pi-tier pihunt-gadgets pihunt-authz pihunt-triage hunt-session hunt-brief submission-shots; do [ -f "$SRC/bin/$l" ] || continue; bk "$H/.local/bin/$l"; run "cp -p '$SRC/bin/$l' '$H/.local/bin/$l'"; rehome "$H/.local/bin/$l"; run "chmod +x '$H/.local/bin/$l'"; done
+ok "pi-hunt (Kimi Code), pi-tier (cost tiering), hunt-session + hunt-brief (session routine)"
 # continuous-recon engine + scheduler + registry helper
 if [ -d "$SRC/recon" ]; then
   run "cp -p '$SRC/recon/recon-engine.sh' '$H/.local/bin/pihunt-recon'" && run "chmod +x '$H/.local/bin/pihunt-recon'"
@@ -155,6 +163,29 @@ if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/nu
   [ -f "$H/.config/systemd/user/pihunt-cve.timer" ] && run "systemctl --user enable --now pihunt-cve.timer" && ok "cve-freshness timer enabled (daily KEV/NVD/EPSS refresh)"
   run "loginctl enable-linger '$USER_NAME'" && ok "linger enabled"
 else warn "systemd --user unavailable. The optional recon/cve timers were not enabled."; fi
+
+c "6c/7  shell env  ->  source LLM provider keys for pi"
+# pi reads provider API keys from the ENVIRONMENT ($OPENROUTER_API_KEY, $RADEON_API_KEY,
+# $GROQ_API_KEY, $MISTRAL_API_KEY, …). The keys live in ~/.pi/secrets/*.env but a shell
+# only has them if its rc sources them — otherwise pi fails with "No API key found for
+# <provider>" (classically openrouter, the coordinator). Add ONE idempotent managed block
+# to the login shell's rc so every new shell (and interactive pi-hunt) sees them.
+case "$(basename "${SHELL:-sh}")" in
+  zsh)  RC="$H/.zshrc" ;;
+  bash) RC="$H/.bashrc" ;;
+  *)    RC="$H/.profile" ;;
+esac
+PKMARK="# >>> pi-hunt provider keys >>>"
+if [ "$DRY" = 1 ]; then printf '   [dry] ensure provider-key sourcing block in %s\n' "$RC"
+elif grep -qF "$PKMARK" "$RC" 2>/dev/null; then ok "provider-key sourcing already present in $(basename "$RC")"
+else
+  { printf '\n%s\n' "$PKMARK"
+    printf '%s\n' "# Source the LLM provider keys pi reads from env (managed by install.sh; safe to re-source)."
+    printf '%s\n' 'for __pk in openrouter amd groq cerebras kimi direct_llm; do [ -f "$HOME/.pi/secrets/$__pk.env" ] && . "$HOME/.pi/secrets/$__pk.env"; done; unset __pk'
+    printf '%s\n' "# <<< pi-hunt provider keys <<<"
+  } >> "$RC" && ok "added provider-key sourcing to $(basename "$RC") — open a new shell or 'source $RC'" \
+    || warn "could not append provider-key sourcing to $RC (add it by hand; see docs/operator/OPERATOR-GUIDE.md §2)"
+fi
 
 c "7/7  verify"
 # Offline self-test of the force-multiplier logic (ensemble/swarm builders, MCP

@@ -11,7 +11,8 @@ All synthesis tools are program-agnostic: default program `digitalocean`, overri
 
 | Layer | Tool | Owns |
 |---|---|---|
-| Launch / drive | `bin/pi-hunt`, `bin/pi-4.8`, `bin/pi-kiro` | start the coordinator + 26 subagents |
+| Launch / drive | `bin/pi-hunt` | start the coordinator + 26 subagents |
+| Session routine | `bin/hunt-session`, `bin/hunt-brief` | quota-aware before/during/after; read-only session brief |
 | Model/provider orchestration | `bin/pi-tier` | which model each agent class runs on + auto-failover |
 | Recon synthesis | `bin/pihunt-gadgets` | rank where to spend the hunt; re-arm killed leads |
 | Authz synthesis | `bin/pihunt-authz` | cross-team verb×resource gaps (forgotten-sibling-verb) |
@@ -23,7 +24,7 @@ All synthesis tools are program-agnostic: default program `digitalocean`, overri
 
 ## ⚠ Deploy model (edit-then-redeploy gotcha)
 
-`pi-hunt`, `pi-4.8`, and `pi-tier` run from `~/.local/bin` as **copies** deployed by `install.sh`.
+`pi-hunt`, `pi-tier`, `hunt-session`, and `hunt-brief` run from `~/.local/bin` as **copies** deployed by `install.sh`.
 Editing the repo's `bin/` version does **not** change the command on your `PATH` until you redeploy:
 
 ```bash
@@ -51,8 +52,6 @@ PIHUNT_COORDINATOR_MODEL=openrouter/deepseek/deepseek-v4.1-flash:high pi-hunt   
 - Launch **Burp** (AI-Agent ext on 127.0.0.1:9876) first if you want Burp MCP tools.
 - Coordinator model is read at launch from `~/.pi/agent/.coordinator-model` (set via `pi-tier set-coordinator`).
 - Auto-continue watchdog is **TUI-only**; toggle live with `/autocontinue off`.
-- `pi-4.8 on|off` — Kimi flagship quality toggle; only touches agents already on a Kimi model.
-- `pi-kiro` — run pi.dev backed by Kiro (Amazon Q) Claude Opus 4.8.
 
 ---
 
@@ -72,12 +71,21 @@ Refs are `provider/model[:thinking]` and must exist in `~/.pi/agent/models.json`
 **Effect applies to NEW spawns**; a coordinator change applies at next launch, elite at next subagent spawn.
 
 ### Auto-failover watchers — start these alongside a long hunt
+> One-liner: **`hunt-session watchers`** starts all six in order. The individual
+> `pi-tier … watch` primitives it runs, if you want just one:
 ```bash
 pi-tier hybrid watch 300 &        # elite pair Kimi<->AMD on Kimi's 5h quota window
 pi-tier amd-fallback watch 300 &  # AMD $1/day cap -> OpenRouter, back on reset
+pi-tier groq-fallback watch 300 & # Groq free-tier (Qwen) 429/down -> OpenRouter, back on recovery
 pi-tier coord-health watch 120 &  # coordinator provider down -> stage healthy fallback
 pi-tier concurrency watch 300 &   # scale PI_SUBAGENT_MAX_CONCURRENCY to # providers up
-pi-tier stall-watch watch 120 &   # ring the desk if the hunt goes idle/hung (NEW)
+pi-tier stall-watch watch 120 &   # ring the desk if the hunt goes idle/hung
+```
+**Stop the watchers** (they run in the background until stopped):
+```bash
+hunt-session down                 # stops ALL of them + clears pidfiles (safe to re-run)
+pi-tier groq-fallback off         # or stop just one by name
+hunt-session status               # show which watchers are currently up
 ```
 
 **concurrency** scaling: sets `PI_SUBAGENT_MAX_CONCURRENCY` in `pihunt-tuning.env` from how many
@@ -115,10 +123,20 @@ pi-tier hybrid off    | amd-fallback off    | coord-health off
 ```bash
 pihunt-gadgets rank       # ranked missing-primitive shopping list (START HERE)
 pihunt-gadgets chains     # per-chain composability (what's blocked on what)
+pihunt-gadgets patterns   # each chain -> hunter pattern + predicted next link + source
 pihunt-gadgets triggers   # which re-arm triggers are ARMED vs WAITING
 pihunt-gadgets check      # exit 10 if any trigger is ARMED (used by run_recon.py)
 pihunt-gadgets report     # write structured-recon/gadgets-report.md
 ```
+**`patterns`** cross-links every chain to the reusable escalation move it instantiates
+(BOLA sibling-sweep, SSRF parser-confusion, cache deception, …), the NEXT link that
+move predicts, and the named researcher it's from — the registry is
+`knowledge/chaining-patterns.jsonl` (repo-tracked, program-agnostic). A chain that
+prints `(no pattern mapped)` wants a new registry entry, not a forced fit.
+**Dead-ends:** a `probe.*` cap that was probed NEGATIVE drops out of the live `rank`
+table into a `# dead-ends` trailer (`KILLED`), and its chain prints `DEAD` in `chains`
+— it re-opens only via a re-arm trigger. If a killed cap shows in the live table, a
+negative probe wasn't recorded in `gadget-graph.jsonl` (fill the node's `grants`).
 **Reading `rank`:** rows are the capabilities no confirmed gadget grants yet, sorted by
 (max tier unblocked → actionable-first → #chains). Classes:
 - `ACTIONABLE (run the probe)` — a `probe.*` cap: the fleet can get it THIS run. Spend here first.
@@ -192,9 +210,8 @@ lead auto-reopens the moment recon finds its missing piece.
 pihunt-gadgets rank && pihunt-authz gaps
 
 # 2. set routing + start the safety watchers for a long run
-pi-tier status
-pi-tier hybrid watch 300 &  pi-tier amd-fallback watch 300 &  pi-tier coord-health watch 120 &
-pi-tier concurrency watch 300 &  pi-tier stall-watch watch 120 &   # scale + hung-hunt alarm
+hunt-session up           # apply tiering + size concurrency to live quota (advises watchers)
+hunt-session watchers     # start all six failover/safety watchers (stop: hunt-session down)
 
 # 3. launch the hunt (you drive the TUI) aimed at the top-ranked targets
 pi-hunt "Hunt digitalocean for CRITICAL"

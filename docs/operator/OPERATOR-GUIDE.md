@@ -13,19 +13,22 @@ dives are linked at the end; this page is the routine.
 
 ## 0. TL;DR routine
 
-> One-shot wrapper: `hunt-session preflight | up | steer | status | down` runs this
-> whole routine quota-aware (`up` = the BEFORE block, `steer` = §6 snapshot,
-> `down` = teardown). Evidence screenshots for a submission: `submission-shots
-> <replay-dir>`. The explicit commands:
+> One-shot wrapper: `hunt-session brief | preflight | up | watchers | steer | status |
+> down` runs this whole routine quota-aware. **`brief` (the default) is a read-only
+> orientation** — last state + the graph+registry suggested next action + quota —
+> auto-printed each session by a SessionStart hook and saved to `SESSION-BRIEF.md`.
+> `up` applies tiering + sizes concurrency and **advises** the watchers; `watchers`
+> starts them; `steer` = §6 snapshot; `down` = teardown. Evidence screenshots for a
+> submission: `submission-shots <replay-dir>`. The explicit commands:
 
 ```bash
 # BEFORE
-pi-tier on                                  # apply model tiering
-pi-tier concurrency once                    # size PI_SUBAGENT_MAX_CONCURRENCY to providers up
-pi-tier hybrid watch 300 &  pi-tier amd-fallback watch 300 & \
-  pi-tier coord-health watch 120 &  pi-tier stall-watch watch 120 &   # safety watchers
-bin/pihunt-gadgets rank && bin/pihunt-authz gaps                      # where to spend budget
+hunt-session brief            # read-only: last state + suggested next action + live quota
+hunt-session up               # apply tiering + size concurrency to live quota (advises watchers)
+hunt-session watchers         # start the six failover/safety watchers (background)
 #   source ~/.pi/secrets/pihunt-tuning.env ; open a fresh shell so concurrency applies
+#   (provider API keys must be in the env too — install.sh wires the rc to source them;
+#    if pi says "No API key found for <provider>": . ~/.pi/secrets/<provider>.env)
 
 # LAUNCH
 pi-hunt
@@ -35,6 +38,12 @@ pi-hunt
 #   update gadget-graph.jsonl (confirm/kill) → submit by hand → record the outcome:
 bin/pihunt-triage record <case> --severity <s> --gadget <g> ; # … submit …
 bin/pihunt-triage verdict <case> <accepted|duplicate|…> [--bounty N] ; bin/pihunt-triage sync
+
+# TEARDOWN (stop the background watchers started by `hunt-session watchers`)
+hunt-session down             # stops ALL watchers + clears pidfiles (safe to re-run)
+#   or stop just one:  pi-tier <name> off
+#   names: hybrid amd-fallback groq-fallback coord-health concurrency stall-watch
+#   see what's running:  hunt-session status
 ```
 
 ---
@@ -46,8 +55,9 @@ bin/pihunt-triage verdict <case> <accepted|duplicate|…> [--bounty N] ; bin/pih
   `~/.pi/agent/agents/` (repo mirror `pi-agent/agents/`).
 - **Launchers (`bin/`, deployed to `~/.local/bin`):** `pi-hunt` (entry),
   `pi-tier` (provider/model orchestration), `pihunt-gadgets` + `pihunt-authz`
-  (recon synthesis), `pihunt-triage` (submission→verdict loop). `pi-4.8` and
-  `pi-kiro` are legacy.
+  (recon synthesis), `pihunt-triage` (submission→verdict loop), `hunt-session` (the
+  quota-aware wrapper: `brief`/`up`/`watchers`/`steer`/`down`) and `hunt-brief` (the
+  read-only session brief the SessionStart hook runs).
 - **Secrets:** `~/.pi/secrets/{openrouter,amd,kimi}.env` (keys),
   `~/.pi/secrets/pihunt-tuning.env` (concurrency/RAM knobs). Never printed/committed.
 - **State (per program, under `reports/<prog>/`, gitignored):**
@@ -61,9 +71,15 @@ bin/pihunt-triage verdict <case> <accepted|duplicate|…> [--bounty N] ; bin/pih
 
 ## 2. BEFORE the hunt — configure & aim
 
-1. **Providers up?** Keys in the three `*.env`; `pi-tier status` shows per-agent
+1. **Providers up?** Keys live in `~/.pi/secrets/*.env`; `pi-tier status` shows per-agent
    models + which refs resolve. `pi-tier coord-health status` probes the
    coordinator's provider (its being down is the classic silent freeze).
+   **Provider keys must be in the shell env** — pi reads `$OPENROUTER_API_KEY`,
+   `$RADEON_API_KEY`, `$GROQ_API_KEY`, `$MISTRAL_API_KEY`, … from the environment.
+   `install.sh` adds a managed block to your shell rc that sources
+   `~/.pi/secrets/{openrouter,amd,groq,cerebras,kimi,direct_llm}.env` (open a fresh
+   shell after install). If pi ever errors **"No API key found for `<provider>`"**, that
+   provider's env file isn't sourced — fix now with `. ~/.pi/secrets/<provider>.env`.
 2. **Apply tiering & concurrency:**
    ```bash
    pi-tier on                     # mechanical/hunters/elite mapping
@@ -72,20 +88,27 @@ bin/pihunt-triage verdict <case> <accepted|duplicate|…> [--bounty N] ; bin/pih
    Concurrency applies at **next launch** (pi reads env at start) — re-source
    `pihunt-tuning.env` or open a new shell, then launch. `pi-tier concurrency
    status` shows live (running pi) vs file value.
-3. **Start the safety watchers** (run alongside a long hunt):
+3. **Start the safety watchers** (run alongside a long hunt) — one wrapper starts all
+   six in the right order (hybrid, amd-fallback, groq-fallback, coord-health,
+   concurrency, stall-watch):
    ```bash
-   pi-tier hybrid watch 300 &        # elite pair Kimi↔AMD on Kimi's 5h quota
-   pi-tier amd-fallback watch 300 &  # AMD $1/day cap → OpenRouter, back on reset
-   pi-tier coord-health watch 120 &  # coordinator provider down → stage healthy fallback
-   pi-tier stall-watch watch 120 &   # ring the desk if the hunt goes idle/hung
+   hunt-session watchers
    ```
+   **Stop them** with `hunt-session down` (all, + clears pidfiles) or `pi-tier <name> off`
+   for one; `hunt-session status` shows which are up. The underlying `pi-tier <name>
+   watch` primitives are in the tooling cheatsheet if you want to start one individually.
 4. **Aim the fleet with the recon synthesis** (the habit that avoids re-hunting
    the hardened core):
    ```bash
    bin/pihunt-gadgets rank      # the single missing primitive that unblocks the most chains
    bin/pihunt-authz gaps        # SPLIT resources: boundary proven on one verb, siblings UNTESTED
+   bin/pihunt-gadgets patterns  # each chain -> the hunter pattern + predicted next link
    bin/pihunt-gadgets triggers  # which re-arm triggers are ARMED (a killed case is reopenable)
    ```
+   **New to these tables?** [reading-the-steer-output.md](reading-the-steer-output.md)
+   walks the five outputs and the rank→gap→launch-instruction decision flow. `patterns`
+   is sourced from the repo-tracked `knowledge/chaining-patterns.jsonl` (named
+   researchers, not guides) — it tells you the *next link* once a probe confirms.
 5. **Scope + identities:** confirm `scope.md` is current; for API criticals build
    the A/B identity rig into `authz-matrix.json` (two tenants, low vs admin).
 
@@ -189,6 +212,9 @@ continuously; lost-work delivery failures cost more than model quality.
 
 ## 7. Deep dives & reference
 
+- **[reading-the-steer-output.md](reading-the-steer-output.md)** — how to read
+  `hunt-session steer` / `rank` / `chains` / `gaps` / `triggers` and turn the top row
+  into a concrete launch instruction (with the ROE guardrails that override the rank).
 - **[pi-hunt-tooling-cheatsheet.md](pi-hunt-tooling-cheatsheet.md)** — full `pi-tier`
   / `pihunt-gadgets` / `pihunt-authz` command reference, watcher internals, the gadget
   graph node shapes and re-arm triggers.

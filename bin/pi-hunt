@@ -8,7 +8,7 @@
 #   elite pair               -> kimi-coding/k3.1-pro (strict-triager, hypothesis-redteam)
 # The coordinator model is read from ~/.pi/agent/.coordinator-model; override for one
 # launch with PIHUNT_COORDINATOR_MODEL=provider/model[:thinking]. Manage the rest with
-# pi-tier (pi-4.8 is the legacy Kimi flagship quality toggle).
+# pi-tier.
 # NOTE: launch Burp Suite (AI-Agent extension listening on 127.0.0.1:9876) before
 # running if you want Burp MCP tools in the session.
 #
@@ -62,7 +62,7 @@ done
 PIHUNT_REPO="${PIHUNT_REPO:-__PIHUNT_HOME__/Desktop/Desktop/harness}"
 export PIHUNT_RECON_ROOT="${PIHUNT_RECON_ROOT:-$PIHUNT_REPO/reports}"
 
-# Coordinator model is state-driven so pi-tier/pi-4.8 can change it without editing
+# Coordinator model is state-driven so pi-tier can change it without editing
 # this launcher. Default is the cheap non-Kimi coordinator; Kimi stays elite-only.
 COORD_STATE="$HOME/.pi/agent/.coordinator-model"
 COORD_MODEL="${PIHUNT_COORDINATOR_MODEL:-$(cat "$COORD_STATE" 2>/dev/null || true)}"

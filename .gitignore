@@ -56,8 +56,13 @@ recon-output/
 # Third-party system-prompt corpus — reference material, not redistributed
 CL4R1T4S/
 
-# Burp MCP extension jar (installed manually via Extender)
+# Burp MCP jars (installed manually; third-party + large — never commit)
 burp-mcp-all.jar
+mcp-servers/burp-mcp-proxy/*.jar
 
 # Vendored JS deps (install with: npm --prefix bin install)
 pi-agent/node_modules-js/
+
+# never commit loose API keys
+.intigriti_key.txt
+*.key.txt

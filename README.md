@@ -171,7 +171,8 @@ Handy toggles:
 pi-tier status    # show per-agent models
 pi-tier on        # apply mechanical/hunter/elite tiers (Kimi stays elite-only)
 pi-tier set-coordinator amd-radeon/DeepSeek-V4.1-Flash:high  # set coordinator model
-pi-4.8 on|off     # legacy Kimi-only quality toggle (does not touch DeepSeek/Mistral agents)
+hunt-session brief   # read-only: last state + suggested next action + quota
+hunt-session up      # apply tiering + size concurrency to live quota (advises watchers)
 pihunt-rag search "ssrf to cloud metadata"     # query the knowledge base
 pihunt-recon acme example.com --deep           # manual recon run (also on a 6h timer)
 ```
@@ -184,7 +185,6 @@ pihunt-recon acme example.com --deep           # manual recon run (also on a 6h 
 4. **Pick the right posture.**
    - Default (elite-only Kimi): coordinator + hunters on `amd-radeon/DeepSeek-V4.1-Flash`, mechanicals on `codestral-latest`, elite pair on `k3.1-pro`. This is what `pi-tier on` applies; `pi-tier status` shows it.
    - `pi-tier set-coordinator google-direct/gemini-3.5-flash-lite:high` for a free coordinator canary; `pi-tier on` restores the DeepSeek hunter fleet.
-   - `pi-4.8 on` is the legacy Kimi quality override (coordinator + any Kimi-fronted flagship agents → `k3.1-pro`). It does **not** pull DeepSeek hunters or Mistral mechanicals back onto Kimi.
 5. **Feed the learning loop.** Tag lessons as you work (`INSTINCT:` / `LESSON:` / `DEADEND:` lines or `/instinct "lesson" --domain x --when "context"`); instincts above the 0.70 confidence threshold auto-promote into the RAG and steer future hunts.
 6. **Tune concurrency to your box.** `PI_SUBAGENT_MAX_CONCURRENCY` / `_MAX_QUEUE` / `_RAM_FLOOR_MB` in `~/.pi/secrets/pihunt-tuning.env` — preset for a 12-core/15 GB host but lowered to **3** (validated with three concurrent Mistral subagents); raise it on Gemini/AMD if limits allow, and lower it further on smaller hardware.
 7. **Headless hunts** (cron/automation): `pi-hunt -p "Hunt <program> for CRITICAL"`.
@@ -233,7 +233,7 @@ legacy/reference-only material and is not on the default runtime path.
 
 | Path | Installs to | What it is |
 |---|---|---|
-| `bin/` | `~/.local/bin/` | `pi-hunt` (coordinator launcher; reads `~/.pi/agent/.coordinator-model`) · `pi-tier` (mechanical/hunter/elite + coordinator tiering) · `pi-4.8` (legacy Kimi quality toggle); `pi-kiro` is legacy-only |
+| `bin/` | `~/.local/bin/` | `pi-hunt` (coordinator launcher; reads `~/.pi/agent/.coordinator-model`) · `pi-tier` (mechanical/hunter/elite + coordinator tiering) · `hunt-session` (quota-aware before/during/after wrapper) · `hunt-brief` (read-only session brief) |
 | `pi-agent/` | `~/.pi/agent/` | `models.json`, `settings.json`, **26 agents**, extensions (subagent ensemble/swarm, mcp-bridge, **human-alert**, auto-continue, compact-on-46, **cmd-optimizer**, session-memory, **continuous-learning**), coordinator prompt, steering + MCP config |
 | `rag/` | `~/.pi-hunt-rag/` + `~/opencode/pihunt-rag-mcp/` | **RAG + knowledge graph** — vectorized search, techniques KB, MCP server ([details](rag/README.md)) |
 | `kiro-gateway/` | — | Legacy Anthropic↔Kiro bridge retained for historical/reference use only |
@@ -287,10 +287,8 @@ pi-tier set-hunter <provider/model>                      pi-tier set-coordinator
 
 The coordinator model is stored in `~/.pi/agent/.coordinator-model` (read by
 `pi-hunt`). `pi-tier on` applies the 8 mechanical / 16 hunter / 2 elite mapping
-without changing the coordinator; use `set-coordinator` for that. `pi-4.8 on|off`
-is the legacy Kimi quality toggle: it rewrites only agents already on
-`kimi-coding/*` and the coordinator state, so DeepSeek hunters and Mistral
-mechanicals survive it unchanged. `pi-tier off` intentionally flattens all
+without changing the coordinator; use `set-coordinator` for that. `pi-tier off`
+intentionally flattens all
 non-elite agents to the Kimi fallback (`k3`) when you want a full Kimi session.
 
 > **Fast/hunter fallbacks.** The default mechanical model is Mistral

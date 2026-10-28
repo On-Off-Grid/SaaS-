@@ -29,6 +29,15 @@
 #                                      per-turn token hog that exhausts the quota).
 #                                      Elite applies at next subagent spawn; a
 #                                      coordinator change applies at next launch.
+#   pi-tier amd-fallback  [once|watch [sec]|status|off|reset]
+#                                      AMD $1/day cap -> OpenRouter DeepSeek, back
+#                                      on reset. Probes + manages ONLY the metered
+#                                      DeepSeek-V4.1-Flash agents; the free
+#                                      V4-Flash agents are never capped, left alone.
+#   pi-tier groq-fallback [once|watch [sec]|status|off|reset]
+#                                      Groq free-tier (Qwen) 429/down -> OpenRouter
+#                                      DeepSeek, back on recovery. Manages agents
+#                                      pinned to groq-direct; idles if none.
 #   pi-tier coord-health [once|watch [sec]|status|off]
 #                                      Coordinator-provider failover. Probes the
 #                                      coordinator's current provider; if it is
@@ -153,7 +162,8 @@ set_agent(){ # $1=agent $2=provider/model[:thinking]
   grep -vE "^$a=" "$OVERRIDES_FILE" > "$OVERRIDES_FILE.tmp" 2>/dev/null || true
   echo "$a=$ref" >> "$OVERRIDES_FILE.tmp"; mv "$OVERRIDES_FILE.tmp" "$OVERRIDES_FILE"
   set_model "$AGENTS/$a.md" "$ref"
-  ok "agent $a -> $ref (persisted; survives 'pi-tier on')"
+  invalidate_fb_snapshots
+  ok "agent $a -> $ref (persisted; survives 'pi-tier on'; fallback snapshots refreshed)"
 }
 
 clear_agent(){ # $1=agent  (remove override, reset to tier default)
@@ -163,6 +173,7 @@ clear_agent(){ # $1=agent  (remove override, reset to tier default)
   elif is_elite_agent "$a"; then ref="$ELITE_DEFAULT"
   else ref=$(hunter_ref); fi
   [ -f "$AGENTS/$a.md" ] && set_model "$AGENTS/$a.md" "$ref"
+  invalidate_fb_snapshots
   ok "agent $a override cleared -> $ref"
 }
 
@@ -342,11 +353,11 @@ hybrid_off(){
 }
 
 # ---------------- AMD daily-budget fallback (AMD $1/day cap -> OpenRouter) ----------------
-# The free AMD/Radeon account has a ~$1/day spend cap. When it is exhausted every AMD
-# model returns 429 "Daily usage limit exceeded". This flips the AMD-tier agents to a
-# paid OpenRouter equivalent when the cap is hit, and back to free AMD when it resets.
-# It snapshots each agent's HOME amd-radeon model so the split (V4-Flash/Qwen) is
-# restored exactly. Reasoning-critical agents already on OpenRouter are not in the
+# The AMD/Radeon $1/day cap is PER-MODEL: the metered DeepSeek-V4.1-Flash (reasoning,
+# what hunters run) hits it and 429s, while the free DeepSeek-V4-Flash (mechanicals)
+# never caps. So this probes V4.1-Flash specifically, and snapshots + flips ONLY the
+# agents on that capped model to a paid OpenRouter equivalent, back when it resets.
+# Agents on the free V4-Flash (and anything already off amd-radeon) are not in the
 # snapshot, so they stay put.
 AMDFB_HOME_FILE="$HOME/.pi/agent/.amdfb-home"
 AMDFB_MODE_FILE="$HOME/.pi/agent/.amdfb-mode"
@@ -356,22 +367,25 @@ AMDFB_AMD_ENV="$HOME/.pi/secrets/amd.env"
 AMDFB_URL="https://developer.amd.com.cn/radeon/api/v1/chat/completions"
 AMDFB_OR_HUNTER="openrouter/deepseek/deepseek-v4.1-flash"   # reasoning fallback for hunters
 AMDFB_OR_FAST="openrouter/deepseek/deepseek-v4-flash"       # cheaper fallback for mechanical
+AMDFB_CAPPED="amd-radeon/DeepSeek-V4.1-Flash"              # the metered model ($1/day cap)
+AMDFB_PROBE_MODEL="DeepSeek-V4.1-Flash"                    # probe the CAPPED model — V4-Flash is free/uncapped so it never signals the cap
 
-amd_usable(){ # 0 = AMD budget OK, 1 = daily cap / unreachable
+amd_usable(){ # 0 = capped-model budget OK, 1 = daily cap / unreachable
   local key code
   [ -f "$AMDFB_AMD_ENV" ] && . "$AMDFB_AMD_ENV" 2>/dev/null
   key="${RADEON_API_KEY:-}"; [ -n "$key" ] || return 1
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$AMDFB_URL" \
     -H "Content-Type: application/json" -H "Authorization: Bearer $key" \
-    -d '{"model":"DeepSeek-V4-Flash","messages":[{"role":"user","content":"x"}],"max_tokens":3}' 2>/dev/null || echo 000)
+    -d "{\"model\":\"$AMDFB_PROBE_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":3}" 2>/dev/null || echo 000)
   [ "$code" = "200" ]
 }
 
-amdfb_snapshot(){ # record home AMD model of every agent currently on amd-radeon (once)
+amdfb_snapshot(){ # record every agent currently on the CAPPED model (once); free
+                  # V4-Flash agents are deliberately NOT managed — they never cap.
   [ -s "$AMDFB_HOME_FILE" ] && return 0
   : > "$AMDFB_HOME_FILE"; local f a m
-  for f in "$AGENTS"/*.md; do a=$(basename "$f" .md); m=$(agent_ref "$f"); case "$m" in amd-radeon/*) echo "$a=$m" >> "$AMDFB_HOME_FILE";; esac; done
-  ok "amd-fallback: snapshotted $(grep -c = "$AMDFB_HOME_FILE") AMD-tier agents"
+  for f in "$AGENTS"/*.md; do a=$(basename "$f" .md); m=$(agent_ref "$f"); case "$m" in "$AMDFB_CAPPED") echo "$a=$m" >> "$AMDFB_HOME_FILE";; esac; done
+  ok "amd-fallback: snapshotted $(grep -c = "$AMDFB_HOME_FILE") agent(s) on $AMDFB_CAPPED"
 }
 
 amdfb_apply(){ # $1 = amd | openrouter
@@ -404,13 +418,93 @@ amdfb_watch(){ local iv="${1:-300}"; echo $$ > "$AMDFB_PID"; ok "amd-fallback wa
 amdfb_status(){
   amdfb_snapshot
   echo "  amd-fallback mode : $(cat "$AMDFB_MODE_FILE" 2>/dev/null || echo unset)"
-  echo "  managed agents    : $(grep -c = "$AMDFB_HOME_FILE") (home snapshot: $AMDFB_HOME_FILE)"
-  if amd_usable; then echo "  AMD daily budget  : OK (free tier usable)"; else echo "  AMD daily budget  : EXHAUSTED (\$1/day cap, 429) — using OpenRouter"; fi
+  echo "  managed agents    : $(grep -c = "$AMDFB_HOME_FILE") on $AMDFB_CAPPED (snapshot: $AMDFB_HOME_FILE)"
+  echo "  (free amd-radeon/DeepSeek-V4-Flash agents are left alone — never capped)"
+  if amd_usable; then echo "  $AMDFB_PROBE_MODEL : OK (answering)"; else echo "  $AMDFB_PROBE_MODEL : CAPPED (\$1/day, 429) — using OpenRouter"; fi
   if [ -f "$AMDFB_PID" ] && kill -0 "$(cat "$AMDFB_PID" 2>/dev/null)" 2>/dev/null; then echo "  watcher           : running (pid $(cat "$AMDFB_PID"))"; else echo "  watcher           : not running"; fi
   [ -f "$AMDFB_LOG" ] && { echo "  recent:"; grep -- '->' "$AMDFB_LOG" 2>/dev/null | tail -3 | sed 's/^/    /'; }
 }
 
 amdfb_off(){ if [ -f "$AMDFB_PID" ] && kill -0 "$(cat "$AMDFB_PID" 2>/dev/null)" 2>/dev/null; then kill "$(cat "$AMDFB_PID")" 2>/dev/null && ok "amd-fallback watcher stopped"; else ok "no amd-fallback watcher running"; fi; rm -f "$AMDFB_PID"; }
+
+# ---------------- Groq free-tier failover (Qwen) ----------------
+# Agents can be pinned to Groq's free Qwen (e.g. the creative hunters). The free
+# tier has RPM/TPM caps and no other watcher covers it. Mirrors amd-fallback:
+# snapshot the agents currently on groq-direct, and when Groq 429s / is unreachable
+# / the key is bad, swing them to the stable OpenRouter DeepSeek reasoning ref,
+# reverting to their Groq home when it recovers. No-op when nothing is on Groq.
+GROQFB_HOME_FILE="$HOME/.pi/agent/.groqfb-home"
+GROQFB_MODE_FILE="$HOME/.pi/agent/.groqfb-mode"
+GROQFB_PID="$HOME/.pi/agent/.groqfb.pid"
+GROQFB_LOG="$HOME/.pi/agent/groq-fallback.log"
+GROQFB_ENV="$HOME/.pi/secrets/groq.env"
+GROQFB_URL="https://api.groq.com/openai/v1/chat/completions"
+GROQFB_PROBE_MODEL="qwen/qwen3.8-27b"
+GROQFB_FALLBACK="$AMDFB_OR_HUNTER"   # stable reasoning ref when Groq is capped
+
+groq_usable(){ # 0 = Groq OK, 1 = rate-limited / unreachable / bad key
+  local key code
+  [ -f "$GROQFB_ENV" ] && . "$GROQFB_ENV" 2>/dev/null
+  key="${GROQ_API_KEY:-}"; [ -n "$key" ] || return 1
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$GROQFB_URL" \
+    -H "Content-Type: application/json" -H "Authorization: Bearer $key" \
+    -d "{\"model\":\"$GROQFB_PROBE_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":3}" 2>/dev/null || echo 000)
+  [ "$code" = "200" ]
+}
+
+groqfb_count(){ local n; n=$(grep -c = "$GROQFB_HOME_FILE" 2>/dev/null); echo "${n:-0}"; }
+
+groqfb_snapshot(){ # record home groq ref of every agent currently on groq-direct (once)
+  [ -s "$GROQFB_HOME_FILE" ] && return 0
+  : > "$GROQFB_HOME_FILE"; local f a m
+  for f in "$AGENTS"/*.md; do a=$(basename "$f" .md); m=$(agent_ref "$f"); case "$m" in groq-direct/*) echo "$a=$m" >> "$GROQFB_HOME_FILE";; esac; done
+  [ "$(groqfb_count)" -gt 0 ] && ok "groq-fallback: snapshotted $(groqfb_count) Groq-tier agent(s)" || true
+}
+
+groqfb_apply(){ # $1 = groq | fallback
+  local mode="$1" line a home
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue; a="${line%%=*}"; home="${line#*=}"
+    [ -f "$AGENTS/$a.md" ] || continue
+    if [ "$mode" = groq ]; then set_model "$AGENTS/$a.md" "$home"
+    else set_model "$AGENTS/$a.md" "$GROQFB_FALLBACK"; fi
+  done < "$GROQFB_HOME_FILE"
+  printf '%s\n' "$mode" > "$GROQFB_MODE_FILE"
+}
+
+groqfb_reconcile(){ # prints on transition; 0 = changed
+  groqfb_snapshot
+  [ "$(groqfb_count)" -gt 0 ] || return 1   # nothing pinned to Groq -> nothing to do
+  local cur desired; cur=$(cat "$GROQFB_MODE_FILE" 2>/dev/null || echo "")
+  if groq_usable; then desired=groq; else desired=fallback; fi
+  if [ "$desired" != "$cur" ]; then
+    groqfb_apply "$desired"
+    printf '%s groq-fallback: %s -> %s (Groq %s) — %s agent(s); applies at next subagent spawn\n' \
+      "$(date "+%F %T")" "${cur:-none}" "$desired" "$([ "$desired" = groq ] && echo "reachable/OK" || echo "capped/down")" "$(groqfb_count)" | tee -a "$GROQFB_LOG"
+    return 0
+  fi
+  printf '%s groq-fallback: steady (%s)\n' "$(date "+%F %T")" "$desired" >> "$GROQFB_LOG"; return 1
+}
+
+groqfb_watch(){ local iv="${1:-300}"; echo $$ > "$GROQFB_PID"; ok "groq-fallback watch (pid $$, every ${iv}s). Log: $GROQFB_LOG"; trap 'rm -f "$GROQFB_PID"; exit 0' INT TERM; groqfb_reconcile || true; while sleep "$iv"; do groqfb_reconcile || true; done; }
+
+groqfb_status(){
+  groqfb_snapshot
+  echo "  groq-fallback mode: $(cat "$GROQFB_MODE_FILE" 2>/dev/null || echo unset)"
+  echo "  managed agents    : $(groqfb_count) (home snapshot: $GROQFB_HOME_FILE)"
+  [ "$(groqfb_count)" -eq 0 ] && echo "  note              : nothing pinned to groq-direct (watcher idles)"
+  if groq_usable; then echo "  Groq free tier    : OK (reachable + keyed)"; else echo "  Groq free tier    : DOWN/CAPPED — using $GROQFB_FALLBACK"; fi
+  if [ -f "$GROQFB_PID" ] && kill -0 "$(cat "$GROQFB_PID" 2>/dev/null)" 2>/dev/null; then echo "  watcher           : running (pid $(cat "$GROQFB_PID"))"; else echo "  watcher           : not running"; fi
+  [ -f "$GROQFB_LOG" ] && { echo "  recent:"; grep -- '->' "$GROQFB_LOG" 2>/dev/null | tail -3 | sed 's/^/    /'; }
+}
+
+groqfb_off(){ if [ -f "$GROQFB_PID" ] && kill -0 "$(cat "$GROQFB_PID" 2>/dev/null)" 2>/dev/null; then kill "$(cat "$GROQFB_PID")" 2>/dev/null && ok "groq-fallback watcher stopped"; else ok "no groq-fallback watcher running"; fi; rm -f "$GROQFB_PID"; }
+
+# A per-agent pin change (set-agent/clear-agent) makes the fallback watchers' one-time
+# home snapshots stale — they would keep re-applying an agent's OLD provider and fight
+# the new pin. Dropping the snapshot+mode files forces both watchers to re-derive their
+# managed set from the now-current agent config on their next reconcile.
+invalidate_fb_snapshots(){ rm -f "$AMDFB_HOME_FILE" "$AMDFB_MODE_FILE" "$GROQFB_HOME_FILE" "$GROQFB_MODE_FILE" 2>/dev/null || true; }
 
 # ---------------- Coordinator-provider health failover ----------------
 # The coordinator runs on one provider (currently OpenRouter). If THAT provider
@@ -674,6 +768,15 @@ case "${1:-status}" in
       off|stop) amdfb_off ;;
       reset) rm -f "$AMDFB_HOME_FILE" "$AMDFB_MODE_FILE"; ok "amd-fallback snapshot/mode cleared" ;;
       *) err "usage: pi-tier amd-fallback {once|watch [sec]|status|off|reset}" ;;
+    esac ;;
+  groq-fallback)
+    case "${2:-once}" in
+      once|reconcile) groqfb_reconcile || true; groqfb_status ;;
+      watch) groqfb_watch "${3:-300}" ;;
+      status) groqfb_status ;;
+      off|stop) groqfb_off ;;
+      reset) rm -f "$GROQFB_HOME_FILE" "$GROQFB_MODE_FILE"; ok "groq-fallback snapshot/mode cleared" ;;
+      *) err "usage: pi-tier groq-fallback {once|watch [sec]|status|off|reset}" ;;
     esac ;;
   coord-health)
     case "${2:-once}" in
