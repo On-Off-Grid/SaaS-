@@ -558,9 +558,31 @@ openrouter_usable(){ # 0 = OpenRouter answering, 1 = down/credits/429/bad key
 # `<name>) <name>_usable ;;` case in provider_usable and (optionally) a COORD_FALLBACKS entry.
 # placeholder_usable(){ return 1; }
 
+# Generic data-driven health probe. Uses the PIHUNT_PROBE_* table that
+# `pihunt-config build` writes into .tier-defaults.sh from providers.toml.
+# Returns 0 = answering, 1 = down/unconfigured, 2 = not in the table (caller falls back).
+probe_provider_generic(){ # $1 = provider name
+  [ -n "${PIHUNT_PROBE_PROVIDERS:-}" ] || return 2
+  case " $PIHUNT_PROBE_PROVIDERS " in *" $1 "*) ;; *) return 2 ;; esac
+  local kf kenv url model ok key code
+  kf="${PIHUNT_PROBE_KEYFILE[$1]:-}"; kenv="${PIHUNT_PROBE_KEYENV[$1]:-}"
+  url="${PIHUNT_PROBE_URL[$1]:-}"; model="${PIHUNT_PROBE_MODEL[$1]:-}"
+  ok="${PIHUNT_PROBE_OKCODES[$1]:-200}"
+  [ -n "$kf" ] && [ -r "$HOME/.pi/secrets/$kf" ] && . "$HOME/.pi/secrets/$kf" 2>/dev/null
+  if [ -n "$kenv" ]; then key="${!kenv:-}"; else key=""; fi
+  [ -n "$key" ] && [ -n "$url" ] || return 1
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$url" \
+    -H "Content-Type: application/json" -H "Authorization: Bearer $key" \
+    -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":1}" 2>/dev/null || echo 000)
+  case " $ok " in *" $code "*) return 0;; *) return 1;; esac
+}
+
 provider_usable(){ # $1 = provider segment of a ref
+  # Data-driven probe (providers.toml) when the overlay provides a table; else the
+  # built-in named probes below (overlay absent => unchanged behavior).
+  probe_provider_generic "$1"; local rc=$?
+  [ "$rc" != 2 ] && return "$rc"
   case "$1" in
-    # placeholder) placeholder_usable ;;   # future provider: uncomment after adding its probe above
     openrouter)  openrouter_usable ;;
     amd-radeon)  amd_usable ;;
     kimi-coding) kimi_available ;;
@@ -621,10 +643,16 @@ CONC_BASE="${CONC_BASE:-3}"    # OpenRouter-only (paid) or none
 conc_current(){ grep -oE 'PI_SUBAGENT_MAX_CONCURRENCY=[0-9]+' "$TUNING_ENV" 2>/dev/null | head -1 | grep -oE '[0-9]+'; }
 
 conc_providers(){ # echoes "<count>|<space-separated up list>"
-  local n=0 up=""
-  openrouter_usable && { n=$((n+1)); up="$up openrouter"; }
-  amd_usable        && { n=$((n+1)); up="$up amd"; }
-  kimi_available    && { n=$((n+1)); up="$up kimi"; }
+  local n=0 up="" name
+  if [ -n "${PIHUNT_PROBE_PROVIDERS:-}" ]; then      # data-driven (providers.toml probe=true)
+    for name in $PIHUNT_PROBE_PROVIDERS; do
+      probe_provider_generic "$name" && { n=$((n+1)); up="$up $name"; }
+    done
+  else                                               # fallback: built-in named probes
+    openrouter_usable && { n=$((n+1)); up="$up openrouter"; }
+    amd_usable        && { n=$((n+1)); up="$up amd"; }
+    kimi_available    && { n=$((n+1)); up="$up kimi"; }
+  fi
   echo "$n|$up"
 }
 

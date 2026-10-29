@@ -257,13 +257,33 @@ def gen_tuning_env(mname, m):
     )
 
 
+def gen_probe_table(providers):
+    """Shell probe table for pi-tier's generic data-driven health probe."""
+    probed = [(n, p) for n, p in providers.items() if p.get("probe")]
+    L = ["",
+         "# Provider health-probe table (providers.toml probe=true) — pi-tier's generic",
+         "# prober (provider_usable / conc_providers) reads this; names drive the up-count.",
+         'PIHUNT_PROBE_PROVIDERS="' + " ".join(n for n, _ in probed) + '"']
+
+    def arr(var, key, default=""):
+        items = " ".join('["%s"]="%s"' % (n, str(p.get(key, default))) for n, p in probed)
+        return "declare -gA %s=( %s )" % (var, items)
+
+    L.append(arr("PIHUNT_PROBE_KEYFILE", "key_file"))
+    L.append(arr("PIHUNT_PROBE_KEYENV", "key_env"))
+    L.append(arr("PIHUNT_PROBE_URL", "health_url"))
+    L.append(arr("PIHUNT_PROBE_MODEL", "probe_model"))
+    L.append(arr("PIHUNT_PROBE_OKCODES", "ok_codes", "200"))
+    return "\n".join(L) + "\n"
+
+
 def cmd_build(cfg, machine, dry):
     mname, m = machine_profile(cfg["machines"], machine)
     if not m:
         err("build: no machine profile (and no [default]) in config/machines.toml"); return 1
 
     models, written, order = gen_models_json(cfg["providers"])
-    td = gen_tier_defaults(cfg["tiers"], cfg["agents"], mname, m, machine)
+    td = gen_tier_defaults(cfg["tiers"], cfg["agents"], mname, m, machine) + gen_probe_table(cfg["providers"])
     tune = gen_tuning_env(mname, m)
     models_text = json.dumps(models, indent=2, ensure_ascii=False) + "\n"
 

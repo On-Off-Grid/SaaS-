@@ -28,6 +28,7 @@ key_env     = "OPENROUTER_API_KEY"
 key_file    = "openrouter.env"
 health_url  = "https://openrouter.ai/api/v1/chat/completions"
 probe_model = "deepseek/deepseek-v4.1-flash"
+ok_codes    = "200 400"   # 400 = endpoint reachable (key/host OK); default is "200"
 
 # ---- AMD Radeon Cloud: free DeepSeek (default hunter + coordinator) ----
 [providers.amd-radeon]
@@ -130,3 +131,4 @@ key_env     = "KIMI_API_KEY"
 key_file    = "kimi.env"
 health_url  = "https://api.kimi.com/coding/v1/chat/completions"
 probe_model = "k3.1-pro"
+ok_codes    = "200 400"
