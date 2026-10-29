@@ -86,3 +86,43 @@ pihunt_program() {
   if [ -n "${PIHUNT_PROGRAM:-}" ]; then printf '%s\n' "$PIHUNT_PROGRAM"; return 0; fi
   pihunt_engagement_get program
 }
+
+# --- TOML list read --------------------------------------------------------
+# pihunt_toml_list <file> <dotted.key>  ->  one array element per line (empty if
+# absent or not a list). Complements pihunt_toml_get, which skips lists. Only
+# scalar elements are printed; nested tables/arrays are skipped.
+pihunt_toml_list() {
+  [ -r "${1:-}" ] || return 0
+  python3 - "$1" "$2" <<'PY'
+import sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as fh:
+        data = tomllib.load(fh)
+except Exception:
+    sys.exit(0)
+cur = data
+for part in sys.argv[2].split("."):
+    if isinstance(cur, dict) and part in cur:
+        cur = cur[part]
+    else:
+        sys.exit(0)
+if isinstance(cur, list):
+    for item in cur:
+        if not isinstance(item, (dict, list)):
+            print(item)
+PY
+}
+
+# --- engagement scope ------------------------------------------------------
+# The [scope] block of the engagement config (local override wins). Read by the
+# ROE/scope guard. Fields:
+#   in_scope / out_of_scope  -> host globs, one per line (pihunt_scope_list)
+#   max_req_per_sec          -> scalar (pihunt_scope_get)
+pihunt_scope_get() { # $1=field (e.g. max_req_per_sec)
+  local f; f="$(pihunt_engagement_file)" || return 0
+  pihunt_toml_get "$f" "scope.$1"
+}
+pihunt_scope_list() { # $1=in_scope|out_of_scope
+  local f; f="$(pihunt_engagement_file)" || return 0
+  pihunt_toml_list "$f" "scope.$1"
+}

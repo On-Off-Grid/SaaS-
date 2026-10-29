@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "pihunt-rag": {
+      "command": "node",
+      "args": ["${HOME}/opencode/pihunt-rag-mcp/server.mjs"],
+      "env": {
+        "PIHUNT_RAG_HOME": "${HOME}/.pi-hunt-rag",
+        "PIHUNT_RAG_REPO": "${CLAUDE_PROJECT_DIR}/rag",
+        "NODE_OPTIONS": "--max-old-space-size=128"
+      }
+    },
+    "burp": {
+      "type": "http",
+      "url": "http://127.0.0.1:9876"
+    },
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_MCP_TOKEN}",
+        "X-MCP-Tools": "search_code,search_repositories,get_file_contents,get_repository_tree,search_issues,search_pull_requests",
+        "X-MCP-Readonly": "true"
+      }
+    }
+  }
+}

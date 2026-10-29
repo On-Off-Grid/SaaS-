@@ -12,3 +12,15 @@ program    = "example-program"   # program slug; drives reports/<program>/ and P
 platform   = "intigriti"         # intigriti | hackerone | yeswehack | bugcrowd | private
 researcher = "your-handle"       # your researcher handle on the platform
 floor      = "HIGH"              # minimum severity to chase: LOW | MEDIUM | HIGH | CRITICAL
+
+[scope]
+# ROE guardrail read by the Claude Code PreToolUse scope guard (bin/pihunt-scope-guard).
+# It is DEFENSE-IN-DEPTH against accidental out-of-scope requests, NOT a security
+# boundary (obfuscated shell can evade host extraction — see the tool header).
+#
+# Leave in_scope EMPTY to disable the guard (it then allows all hosts). Populate it
+# from your program's scope page to ACTIVATE: any external host not matched here is
+# challenged (localhost / private ranges are always allowed). Globs use fnmatch.
+in_scope        = []   # e.g. ["*.digitalocean.com", "api.digitalocean.com"]
+out_of_scope    = []   # e.g. ["status.digitalocean.com"] — always denied, even if in_scope matches
+max_req_per_sec = 10   # advisory rate floor surfaced to the operator

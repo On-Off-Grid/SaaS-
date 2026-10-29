@@ -11,8 +11,8 @@ of files here, runs the installer, and hunts — without touching tool code.
 
 | File | Committed? | Purpose |
 |------|-----------|---------|
-| `engagement.toml` | yes (template) | The hunt engagement: `program` / `platform` / `researcher` / `floor`. Generic placeholder values. |
-| `engagement.local.toml` | **no** (git-ignored) | Your real engagement. Overrides `engagement.toml`. This is what keeps a machine pointed at its actual program. |
+| `engagement.toml` | yes (template) | The hunt engagement: `program` / `platform` / `researcher` / `floor`, plus a `[scope]` ROE block. Generic placeholder values. |
+| `engagement.local.toml` | **no** (git-ignored) | Your real engagement + your real `[scope]`. Overrides `engagement.toml`. This is what keeps a machine pointed at its actual program. |
 | `providers.toml` | yes | LLM provider definitions: `base_url`, `api`, key env-var, `models[]`, cost, probe metadata. `pihunt-config build` regenerates `models.json` from the `managed` blocks (dormant preserved). |
 | `tiers.toml` | yes | Tier → model map (fast/hunter/flagship/elite/coordinator) + which agent is in which tier. Compiled into pi-tier's tier defaults. |
 | `machines.toml` | yes | **Generic** machine profiles (`[laptop]` / `[desktop]` / `[default]`): cores, RAM, concurrency ceiling. Shareable; no box-specific data. |
@@ -41,6 +41,27 @@ $EDITOR config/engagement.local.toml      # set program / platform / researcher 
 # or, one-off for a single shell:
 export PIHUNT_PROGRAM=yourprogram
 ```
+
+## Set your scope (ROE guard)
+
+The `[scope]` block in `engagement.local.toml` backs the Claude Code `PreToolUse`
+scope guard (`bin/pihunt-scope-guard`): a defense-in-depth guardrail that challenges
+`Bash`/`WebFetch` calls to hosts outside your program's scope. It is **not** a
+security boundary — obfuscated shell can evade it; it catches honest mistakes and
+accidental pivots. Layer it under the sandbox and Burp's `scope_check`.
+
+```toml
+[scope]
+in_scope        = ["*.digitalocean.com", "api.digitalocean.com"]
+out_of_scope    = ["status.digitalocean.com"]
+max_req_per_sec = 10
+```
+
+- **`in_scope` empty → the guard is disabled** (allows all hosts). Populate it from
+  your program's scope page to activate.
+- `out_of_scope` is always denied, even if an `in_scope` glob would match.
+- `localhost` / private ranges are always allowed (local tooling).
+- Read by `pihunt_scope_list` / `pihunt_scope_get` in `lib/pihunt-common.sh`.
 
 ## Commands (`pihunt-config` / `make`)
 
