@@ -80,19 +80,25 @@ HUNTER_STATE="$HOME/.pi/agent/.hunter-state"
 FLAGSHIP_STATE="$HOME/.pi/agent/.flagship-state"
 COORD_STATE="$HOME/.pi/agent/.coordinator-model"
 OVERRIDES_FILE="$HOME/.pi/agent/.agent-overrides"
-FAST_DEFAULT="mistral-direct/codestral-latest"
-HUNTER_DEFAULT="amd-radeon/DeepSeek-V4.1-Flash"
-FLAGSHIP_DEFAULT="kimi-coding/k3"
-COORD_DEFAULT="amd-radeon/DeepSeek-V4.1-Flash:high"
+# Config overlay: `pihunt-config build` writes tier defaults + agent arrays +
+# COORD_FALLBACKS + CONC_* here from config/*.toml. Sourced so it OVERRIDES the
+# built-in fallbacks below; absent (not yet built) => behavior unchanged.
+PIHUNT_TIER_DEFAULTS="${PIHUNT_TIER_DEFAULTS:-$HOME/.pi/agent/.tier-defaults.sh}"
+[ -r "$PIHUNT_TIER_DEFAULTS" ] && . "$PIHUNT_TIER_DEFAULTS"
+
+FAST_DEFAULT="${FAST_DEFAULT:-mistral-direct/codestral-latest}"
+HUNTER_DEFAULT="${HUNTER_DEFAULT:-amd-radeon/DeepSeek-V4.1-Flash}"
+FLAGSHIP_DEFAULT="${FLAGSHIP_DEFAULT:-openrouter/deepseek/deepseek-v4.1-flash}"   # was kimi-coding/k3; Kimi dropped 2026-10-28
+COORD_DEFAULT="${COORD_DEFAULT:-amd-radeon/DeepSeek-V4.1-Flash:high}"
 KIMI="kimi-coding"
 
-ELITE_AGENTS=(
+if [ -z "${ELITE_AGENTS+x}" ]; then ELITE_AGENTS=(
   strict-triager
   hypothesis-redteam
-)
-ELITE_DEFAULT="kimi-coding/k3.1-pro"
+); fi
+ELITE_DEFAULT="${ELITE_DEFAULT:-openrouter/deepseek/deepseek-v4.1-flash}"   # was kimi-coding/k3.1-pro; elite pair now on paid OpenRouter
 
-FAST_AGENTS=(
+if [ -z "${FAST_AGENTS+x}" ]; then FAST_AGENTS=(
   h1-scope-loader
   intigriti-scope-loader
   yeswehack-scope-loader
@@ -101,7 +107,7 @@ FAST_AGENTS=(
   visual-security
   payload-researcher
   wordlist-curator
-)
+); fi
 
 ok(){ printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
 err(){ printf '  \033[1;31m✗ %s\033[0m\n' "$*"; }
@@ -128,6 +134,7 @@ flagship_ref(){ state_ref "$FLAGSHIP_STATE" "$FLAGSHIP_DEFAULT"; }
 coord_ref(){ state_ref "$COORD_STATE" "$COORD_DEFAULT"; }
 
 have_model(){ # $1 = provider/model[:thinking]  (ollama ids may contain a :tag)
+  case "$1" in openrouter/*) return 0 ;; esac   # openrouter is a pi BUILT-IN provider; its models aren't in models.json but pi resolves them at runtime (keyed from openrouter.env)
   local raw="${1#*/}"
   grep -q "\"id\":[[:space:]]*\"$raw\"" "$MODELS_JSON" 2>/dev/null && return 0
   local base="${raw%:*}"
@@ -361,6 +368,7 @@ hybrid_off(){
 # snapshot, so they stay put.
 AMDFB_HOME_FILE="$HOME/.pi/agent/.amdfb-home"
 AMDFB_MODE_FILE="$HOME/.pi/agent/.amdfb-mode"
+AMDFB_COOLDOWN_FILE="$HOME/.pi/agent/.amdfb-cooldown"   # epoch of last cap-flip to openrouter (debounce, stops the 5-min flap)
 AMDFB_PID="$HOME/.pi/agent/.amdfb.pid"
 AMDFB_LOG="$HOME/.pi/agent/amd-fallback.log"
 AMDFB_AMD_ENV="$HOME/.pi/secrets/amd.env"
@@ -400,12 +408,23 @@ amdfb_apply(){ # $1 = amd | openrouter
   printf '%s\n' "$mode" > "$AMDFB_MODE_FILE"
 }
 
-amdfb_reconcile(){ # prints on transition; 0 = changed
-  amdfb_snapshot
-  local cur desired; cur=$(cat "$AMDFB_MODE_FILE" 2>/dev/null || echo "")
+amdfb_reconcile(){ # prints on transition; 0 = changed. DEBOUNCED: after a cap-flip to openrouter, hold
+  amdfb_snapshot                                 # openrouter for AMDFB_COOLDOWN before retrying AMD, so AMD's
+  local cur desired now last cd                  # ~$1/day budget can't drive the 5-min flap that wedged subagents.
+  cd="${PIHUNT_AMDFB_COOLDOWN:-7200}"
+  cur=$(cat "$AMDFB_MODE_FILE" 2>/dev/null || echo "")
   if amd_usable; then desired=amd; else desired=openrouter; fi
+  # hold on openrouter through the cooldown even if AMD looks usable again
+  if [ "$desired" = amd ] && [ "$cur" = openrouter ]; then
+    now=$(date +%s); last=$(cat "$AMDFB_COOLDOWN_FILE" 2>/dev/null || echo 0); case "$last" in ''|*[!0-9]*) last=0;; esac
+    if [ $(( now - last )) -lt "$cd" ]; then
+      printf '%s amd-fallback: steady (openrouter; AMD up but holding %ds/%ds cooldown to avoid flap)\n' "$(date "+%F %T")" "$(( now - last ))" "$cd" >> "$AMDFB_LOG"
+      return 1
+    fi
+  fi
   if [ "$desired" != "$cur" ]; then
     amdfb_apply "$desired"
+    [ "$desired" = openrouter ] && date +%s > "$AMDFB_COOLDOWN_FILE"   # start cooldown on cap-flip
     printf '%s amd-fallback: %s -> %s (AMD %s) — %s agents; applies at next subagent spawn\n' \
       "$(date "+%F %T")" "${cur:-none}" "$desired" "$([ "$desired" = amd ] && echo "budget reset/OK" || echo "daily cap hit")" "$(grep -c = "$AMDFB_HOME_FILE")" | tee -a "$AMDFB_LOG"
     return 0
@@ -519,11 +538,10 @@ COORDH_LOG="$HOME/.pi/agent/coord-health.log"
 OR_KEY_ENV="$HOME/.pi/secrets/openrouter.env"
 OR_URL="https://openrouter.ai/api/v1/chat/completions"
 # Reasoning-capable coordinator fallbacks, most-reliable first. Each is provider/model.
-COORD_FALLBACKS=(
+if [ -z "${COORD_FALLBACKS+x}" ]; then COORD_FALLBACKS=(
   "openrouter/deepseek/deepseek-v4.1-flash:high"
   "amd-radeon/DeepSeek-V4.1-Flash:high"
-  "kimi-coding/k3.1-pro"
-)
+); fi
 
 openrouter_usable(){ # 0 = OpenRouter answering, 1 = down/credits/429/bad key
   local key code
@@ -535,7 +553,35 @@ openrouter_usable(){ # 0 = OpenRouter answering, 1 = down/credits/429/bad key
   case "$code" in 200|400) return 0;; *) return 1;; esac
 }
 
+# --- PLACEHOLDER for a future provider's health probe (codecraft removed 2026-10-28) ---
+# Copy openrouter_usable, point it at the new provider's URL + key env, then add a
+# `<name>) <name>_usable ;;` case in provider_usable and (optionally) a COORD_FALLBACKS entry.
+# placeholder_usable(){ return 1; }
+
+# Generic data-driven health probe. Uses the PIHUNT_PROBE_* table that
+# `pihunt-config build` writes into .tier-defaults.sh from providers.toml.
+# Returns 0 = answering, 1 = down/unconfigured, 2 = not in the table (caller falls back).
+probe_provider_generic(){ # $1 = provider name
+  [ -n "${PIHUNT_PROBE_PROVIDERS:-}" ] || return 2
+  case " $PIHUNT_PROBE_PROVIDERS " in *" $1 "*) ;; *) return 2 ;; esac
+  local kf kenv url model ok key code
+  kf="${PIHUNT_PROBE_KEYFILE[$1]:-}"; kenv="${PIHUNT_PROBE_KEYENV[$1]:-}"
+  url="${PIHUNT_PROBE_URL[$1]:-}"; model="${PIHUNT_PROBE_MODEL[$1]:-}"
+  ok="${PIHUNT_PROBE_OKCODES[$1]:-200}"
+  [ -n "$kf" ] && [ -r "$HOME/.pi/secrets/$kf" ] && . "$HOME/.pi/secrets/$kf" 2>/dev/null
+  if [ -n "$kenv" ]; then key="${!kenv:-}"; else key=""; fi
+  [ -n "$key" ] && [ -n "$url" ] || return 1
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$url" \
+    -H "Content-Type: application/json" -H "Authorization: Bearer $key" \
+    -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":1}" 2>/dev/null || echo 000)
+  case " $ok " in *" $code "*) return 0;; *) return 1;; esac
+}
+
 provider_usable(){ # $1 = provider segment of a ref
+  # Data-driven probe (providers.toml) when the overlay provides a table; else the
+  # built-in named probes below (overlay absent => unchanged behavior).
+  probe_provider_generic "$1"; local rc=$?
+  [ "$rc" != 2 ] && return "$rc"
   case "$1" in
     openrouter)  openrouter_usable ;;
     amd-radeon)  amd_usable ;;
@@ -590,17 +636,23 @@ coordh_off(){ if [ -f "$COORDH_PID" ] && kill -0 "$(cat "$COORDH_PID" 2>/dev/nul
 TUNING_ENV="$HOME/.pi/secrets/pihunt-tuning.env"
 CONCWATCH_PID="$HOME/.pi/agent/.concwatch.pid"
 CONCWATCH_LOG="$HOME/.pi/agent/concurrency.log"
-CONC_HIGH=6    # all three providers up (OpenRouter + AMD + Kimi)
-CONC_MID=4     # two providers up
-CONC_BASE=3    # OpenRouter-only (paid) or none
+CONC_HIGH="${CONC_HIGH:-6}"    # 3 providers up   (overridden by the machine profile via .tier-defaults.sh)
+CONC_MID="${CONC_MID:-4}"      # 2 providers up
+CONC_BASE="${CONC_BASE:-3}"    # OpenRouter-only (paid) or none
 
 conc_current(){ grep -oE 'PI_SUBAGENT_MAX_CONCURRENCY=[0-9]+' "$TUNING_ENV" 2>/dev/null | head -1 | grep -oE '[0-9]+'; }
 
 conc_providers(){ # echoes "<count>|<space-separated up list>"
-  local n=0 up=""
-  openrouter_usable && { n=$((n+1)); up="$up openrouter"; }
-  amd_usable        && { n=$((n+1)); up="$up amd"; }
-  kimi_available    && { n=$((n+1)); up="$up kimi"; }
+  local n=0 up="" name
+  if [ -n "${PIHUNT_PROBE_PROVIDERS:-}" ]; then      # data-driven (providers.toml probe=true)
+    for name in $PIHUNT_PROBE_PROVIDERS; do
+      probe_provider_generic "$name" && { n=$((n+1)); up="$up $name"; }
+    done
+  else                                               # fallback: built-in named probes
+    openrouter_usable && { n=$((n+1)); up="$up openrouter"; }
+    amd_usable        && { n=$((n+1)); up="$up amd"; }
+    kimi_available    && { n=$((n+1)); up="$up kimi"; }
+  fi
   echo "$n|$up"
 }
 
@@ -689,11 +741,18 @@ STALLW_LOG="$HOME/.pi/agent/stall-watch.log"
 STALLW_SESS_DIR="$HOME/.pi/agent/sessions"
 STALLW_LAST_ALARM="$HOME/.pi/agent/.stallwatch-last-alarm"
 STALLW_SOUND="/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
-STALLW_THRESH="${PIHUNT_STALL_THRESHOLD:-600}"
+STALLW_THRESH="${PIHUNT_STALL_THRESHOLD:-600}"          # hard alarm: no progress this long
+STALLW_FASTPATH="${PIHUNT_STALL_FASTPATH:-240}"         # soft early-warning when hang-shaped (net-wait, no progress)
 STALLW_REALARM="${PIHUNT_STALL_REALARM:-900}"
 STALLW_CASEFILE="${PIHUNT_CASEFILE:-$PWD/.pi/casefile.jsonl}"
+STALLW_STATE="$HOME/.pi/agent/.stall-state.json"        # machine-readable current classification (rewritten each tick)
+STALLW_LEDGER="${PIHUNT_STALL_LEDGER:-$HOME/.pi/agent/stall-ledger.jsonl}"  # append-only stall history
+STALLW_WEBHOOK="${PIHUNT_ALERT_WEBHOOK:-}"              # optional out-of-band POST (Slack/ntfy/Telegram {"text":...})
+STALLW_COORD_LOG="$HOME/.pi/agent/coord-health.log"     # provider-down cross-reference
+STALLW_CPU_WIN="${PIHUNT_STALL_CPU_WIN:-2}"             # seconds sampled to tell on-CPU (spinning) from blocked (waiting)
 
 pi_alive(){ pgrep -x pi >/dev/null 2>&1; }
+stallw_pids(){ pgrep -x pi 2>/dev/null; }
 
 stallw_newest_mtime(){ # epoch secs of the most recent transcript/casefile write, or 0
   local newest=0 m
@@ -708,51 +767,140 @@ stallw_newest_mtime(){ # epoch secs of the most recent transcript/casefile write
   echo "$newest"
 }
 
-stallw_alarm(){ # $1=message; rate-limited by STALLW_REALARM; respects PIHUNT_ALERT=0 / dry-run
-  local msg="$1" now last
-  now=$(date +%s); last=$(cat "$STALLW_LAST_ALARM" 2>/dev/null || echo 0)
-  case "$last" in ''|*[!0-9]*) last=0;; esac
-  [ $((now - last)) -lt "$STALLW_REALARM" ] && return 0
-  echo "$now" > "$STALLW_LAST_ALARM"
-  printf '%s stall-watch: ALARM %s\n' "$(date '+%F %T')" "$msg" | tee -a "$STALLW_LOG"
-  [ "${PIHUNT_ALERT:-1}" = "0" ] && return 0
-  [ "${PIHUNT_STALL_DRY_RUN:-0}" = "1" ] && return 0
-  ( DISPLAY="${DISPLAY:-:0}" notify-send -u critical -t 0 --expire-time 0 "pi-hunt: HUNT STALLED" "$msg" >/dev/null 2>&1 & )
-  ( paplay "$STALLW_SOUND" >/dev/null 2>&1 & ); ( paplay "$STALLW_SOUND" >/dev/null 2>&1 & )
-  ( spd-say "Bug bounty hunt stalled, the agents are idle. Please check." >/dev/null 2>&1 & )
+# --- process + provider signals: turn a bare "idle" into a cause + action ---
+stallw_cpu_ns(){ awk '{print $1+0}' "/proc/$1/schedstat" 2>/dev/null || echo 0; }  # cumulative on-CPU ns
+
+stallw_root_pid(){ # the pi at the top of the tree (its ppid is not itself a pi); else the first pi
+  local pids p pp; pids=" $(stallw_pids | tr '\n' ' ') "
+  for p in $pids; do
+    pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    case "$pids" in *" $pp "*) : ;; *) echo "$p"; return 0 ;; esac
+  done
+  stallw_pids | head -1
 }
 
-stallw_check(){ # 0 = stalled (alarmed), 1 = healthy / not running
-  local newest now age
+stallw_proc_signal(){ # -> "ONCPU|BLOCKED <state> <wchan>"; samples CPU of all pi pids over the window
+  local pids p a b sum=0 root st wc tmp
+  pids=$(stallw_pids); [ -z "$pids" ] && { echo "GONE - -"; return; }
+  tmp="$HOME/.pi/agent/.stallw-cpu.$$"; : > "$tmp"
+  for p in $pids; do echo "$p $(stallw_cpu_ns "$p")" >> "$tmp"; done
+  sleep "$STALLW_CPU_WIN"
+  while read -r p a; do b=$(stallw_cpu_ns "$p"); sum=$((sum + b - a)); done < "$tmp"
+  rm -f "$tmp"
+  root=$(stallw_root_pid)
+  st=$(ps -o stat= -p "$root" 2>/dev/null | tr -d ' '); st="${st:-?}"
+  wc=$(cat "/proc/$root/wchan" 2>/dev/null); wc="${wc:-?}"
+  if [ "$sum" -gt 50000000 ]; then echo "ONCPU $st $wc"; else echo "BLOCKED $st $wc"; fi   # >50ms CPU/window = working, not blocked
+}
+
+stallw_provider_down(){ # 0 if coord-health's newest line reports the coordinator provider DOWN (failover not yet applied)
+  [ -f "$STALLW_COORD_LOG" ] || return 1
+  case "$(tail -n 1 "$STALLW_COORD_LOG" 2>/dev/null)" in *DOWN*) return 0 ;; *) return 1 ;; esac
+}
+
+stallw_json_escape(){ printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+stallw_write_state(){ # $1=class $2=idle_s $3=proc_sig $4=action  -> rewrite the current-state file
+  printf '{"ts":"%s","class":"%s","idle_s":%s,"proc":"%s","action":"%s","pids":"%s"}\n' \
+    "$(date -Is 2>/dev/null)" "$1" "${2:-0}" "$(stallw_json_escape "$3")" "$(stallw_json_escape "$4")" \
+    "$(stallw_pids | tr '\n' ' ' | sed 's/ *$//')" > "$STALLW_STATE" 2>/dev/null || true
+}
+
+stallw_ledger_add(){ # $1=class $2=idle_s $3=proc_sig $4=action  -> append one event
+  printf '{"ts":"%s","class":"%s","idle_s":%s,"proc":"%s","action":"%s"}\n' \
+    "$(date -Is 2>/dev/null)" "$1" "${2:-0}" "$(stallw_json_escape "$3")" "$(stallw_json_escape "$4")" \
+    >> "$STALLW_LEDGER" 2>/dev/null || true
+}
+
+stallw_webhook(){ # $1=text ; best-effort, non-blocking, only when PIHUNT_ALERT_WEBHOOK is set
+  [ -n "$STALLW_WEBHOOK" ] || return 0
+  local t; t=$(stallw_json_escape "$1")
+  ( curl -m 10 -sS -X POST -H 'Content-Type: application/json' --data "{\"text\":\"$t\"}" "$STALLW_WEBHOOK" >/dev/null 2>&1 & )
+}
+
+stallw_alarm(){ # $1=severity(soft|hard) $2=class $3=idle_s $4=proc_sig $5=message
+  local sev="$1" class="$2" idle="$3" sig="$4" msg="$5" now last
+  stallw_ledger_add "$class" "$idle" "$sig" "$msg"
+  printf '%s stall-watch: %s [%s] %s\n' "$(date '+%F %T')" "$(printf '%s' "$sev" | tr '[:lower:]' '[:upper:]')" "$class" "$msg" | tee -a "$STALLW_LOG"
+  [ "${PIHUNT_ALERT:-1}" = "0" ] && return 0
+  [ "${PIHUNT_STALL_DRY_RUN:-0}" = "1" ] && return 0
+  now=$(date +%s); last=$(cat "$STALLW_LAST_ALARM" 2>/dev/null || echo 0); case "$last" in ''|*[!0-9]*) last=0;; esac
+  [ $((now - last)) -lt "$STALLW_REALARM" ] && return 0      # rate-limit outbound alerts
+  echo "$now" > "$STALLW_LAST_ALARM"
+  if [ "$sev" = "hard" ]; then
+    ( DISPLAY="${DISPLAY:-:0}" notify-send -u critical -t 0 --expire-time 0 "pi-hunt: STALLED [$class]" "$msg" >/dev/null 2>&1 & )
+    ( paplay "$STALLW_SOUND" >/dev/null 2>&1 & ); ( paplay "$STALLW_SOUND" >/dev/null 2>&1 & )
+    ( spd-say "Bug bounty hunt stalled. $class. Please check." >/dev/null 2>&1 & )
+    stallw_webhook "pi-hunt STALLED [$class] — $msg"
+  else
+    stallw_webhook "pi-hunt early-warning [$class] — $msg"
+  fi
+}
+
+stallw_check(){ # 0 = alarmed, 1 = healthy / not running
+  local newest now age sig state wch cls act
   if ! pi_alive; then
+    stallw_write_state "NO_HUNT" 0 "GONE - -" "no pi process (hunt down or paused)"
     printf '%s stall-watch: no pi process running\n' "$(date '+%F %T')" >> "$STALLW_LOG"; return 1
   fi
   newest=$(stallw_newest_mtime); now=$(date +%s)
   if [ "$newest" -le 0 ]; then
+    stallw_write_state "WARMUP" 0 "- - -" "pi up but no transcript/casefile yet"
     printf '%s stall-watch: pi alive but no transcript/casefile found under %s\n' "$(date '+%F %T')" "$STALLW_SESS_DIR" >> "$STALLW_LOG"; return 1
   fi
   age=$((now - newest))
-  if [ "$age" -ge "$STALLW_THRESH" ]; then
-    stallw_alarm "pi alive but idle ${age}s (no transcript/casefile write; threshold ${STALLW_THRESH}s) — coordinator or subagents hung; check the TUI / relaunch"
-    return 0
+  if [ "$age" -lt "$STALLW_FASTPATH" ]; then
+    stallw_write_state "HEALTHY" "$age" "progressing" "last write ${age}s ago"
+    printf '%s stall-watch: healthy (last write %ds ago; fast=%ds hard=%ds)\n' "$(date '+%F %T')" "$age" "$STALLW_FASTPATH" "$STALLW_THRESH" >> "$STALLW_LOG"
+    return 1
   fi
-  printf '%s stall-watch: healthy (last write %ds ago, threshold %ds)\n' "$(date '+%F %T')" "$age" "$STALLW_THRESH" >> "$STALLW_LOG"
-  return 1
+  sig=$(stallw_proc_signal); state=${sig%% *}; wch=${sig##* }
+  # classify by what the ROOT is waiting on first — an I/O wait is the real hang signal even if
+  # a subagent is burning minor background CPU (don't let idle event-loop ticks read as SPINNING).
+  if stallw_provider_down; then
+    cls="PROVIDER_DOWN"; act="coordinator provider down (see coord-health.log); failover staged in .coordinator-model — RELAUNCH to apply"
+  else
+    case "$wch" in
+      *epoll*|*poll*|*futex*|*sk_wait*|*inet*|*tcp*|*read_*|*wait_woken*)
+        cls="HUNG_IO"; act="root blocked in '$wch', no progress ${age}s — hung/stalled LLM stream (idle-timeout not catching it); relaunch (or kill the stuck subagent)" ;;
+      *)
+        if [ "$state" = "ONCPU" ]; then
+          cls="SPINNING"; act="on-CPU and NOT I/O-blocked, no write ${age}s — stuck in a local loop; relaunch if it persists"
+        else
+          cls="IDLE"; act="no progress ${age}s; state=$state wchan=$wch — check the TUI" ;
+        fi ;;
+    esac
+  fi
+  if [ "$age" -ge "$STALLW_THRESH" ] || [ "$cls" = "PROVIDER_DOWN" ] || [ "$cls" = "SPINNING" ]; then
+    stallw_write_state "$cls" "$age" "$sig" "$act"
+    stallw_alarm hard "$cls" "$age" "$sig" "idle ${age}s — $act"
+  else
+    stallw_write_state "$cls" "$age" "$sig" "$act"
+    stallw_alarm soft "$cls" "$age" "$sig" "idle ${age}s (early warning) — $act"
+  fi
+  return 0
 }
 
-stallw_watch(){ local iv="${1:-120}"; echo $$ > "$STALLW_PID"; ok "stall-watch (pid $$, every ${iv}s, idle>=${STALLW_THRESH}s). Log: $STALLW_LOG"; trap 'rm -f "$STALLW_PID"; exit 0' INT TERM; stallw_check || true; while sleep "$iv"; do stallw_check || true; done; }
+stallw_watch(){ local iv="${1:-120}"; echo $$ > "$STALLW_PID"; ok "stall-watch (pid $$, every ${iv}s; soft=${STALLW_FASTPATH}s hard=${STALLW_THRESH}s). Log: $STALLW_LOG"; trap 'rm -f "$STALLW_PID"; exit 0' INT TERM; stallw_check || true; while sleep "$iv"; do stallw_check || true; done; }
 
 stallw_status(){
   local newest now age
-  if pi_alive; then echo "  pi process          : running (pid $(pgrep -x pi | tr '\n' ' '))"; else echo "  pi process          : not running"; fi
+  if pi_alive; then echo "  pi process          : running (pid $(stallw_pids | tr '\n' ' '))"; else echo "  pi process          : not running"; fi
   newest=$(stallw_newest_mtime); now=$(date +%s)
   if [ "$newest" -gt 0 ]; then age=$((now - newest)); echo "  last hunt activity  : ${age}s ago ($(date -d "@$newest" '+%F %T' 2>/dev/null))"; else echo "  last hunt activity  : none found"; fi
-  echo "  stall threshold     : ${STALLW_THRESH}s   re-alarm gap: ${STALLW_REALARM}s"
+  echo "  thresholds          : soft=${STALLW_FASTPATH}s  hard=${STALLW_THRESH}s  re-alarm=${STALLW_REALARM}s"
   echo "  watching            : $STALLW_SESS_DIR + $STALLW_CASEFILE"
-  if pi_alive && [ "$newest" -gt 0 ] && [ "$((now - newest))" -ge "$STALLW_THRESH" ]; then echo "  state               : ⚠ STALLED — check the TUI / relaunch";
-  elif pi_alive; then echo "  state               : active"; else echo "  state               : idle (no hunt)"; fi
+  if [ -n "$STALLW_WEBHOOK" ]; then echo "  out-of-band         : webhook configured"; else echo "  out-of-band         : none (export PIHUNT_ALERT_WEBHOOK=<url> for off-desk alerts)"; fi
+  [ -f "$STALLW_STATE" ] && echo "  current             : $(cat "$STALLW_STATE" 2>/dev/null)"
   if [ -f "$STALLW_PID" ] && kill -0 "$(cat "$STALLW_PID" 2>/dev/null)" 2>/dev/null; then echo "  watcher             : running (pid $(cat "$STALLW_PID"))"; else echo "  watcher             : not running"; fi
-  [ -f "$STALLW_LOG" ] && { echo "  recent:"; grep -- 'ALARM' "$STALLW_LOG" 2>/dev/null | tail -3 | sed 's/^/    /'; }
+  [ -f "$STALLW_LEDGER" ] && { echo "  recent stalls:"; tail -3 "$STALLW_LEDGER" 2>/dev/null | sed 's/^/    /'; }
+}
+
+stallw_report(){
+  if [ ! -s "$STALLW_LEDGER" ]; then echo "no stall ledger yet ($STALLW_LEDGER)"; return; fi
+  echo "stall ledger: $STALLW_LEDGER   ($(wc -l < "$STALLW_LEDGER" | tr -d ' ') events)"
+  echo "  by class:"; sed -n 's/.*"class":"\([^"]*\)".*/\1/p' "$STALLW_LEDGER" | sort | uniq -c | sort -rn | sed 's/^/    /'
+  echo "  last 5:"; tail -5 "$STALLW_LEDGER" | sed 's/^/    /'
 }
 
 stallw_off(){ if [ -f "$STALLW_PID" ] && kill -0 "$(cat "$STALLW_PID" 2>/dev/null)" 2>/dev/null; then kill "$(cat "$STALLW_PID")" 2>/dev/null && ok "stall-watch stopped"; else ok "no stall-watch running"; fi; rm -f "$STALLW_PID"; }
@@ -828,8 +976,9 @@ case "${1:-status}" in
       once|check) stallw_check || true; stallw_status ;;
       watch) stallw_watch "${3:-120}" ;;
       status) stallw_status ;;
+      report) stallw_report ;;
       off|stop) stallw_off ;;
-      *) err "usage: pi-tier stall-watch {once|watch [sec]|status|off}" ;;
+      *) err "usage: pi-tier stall-watch {once|watch [sec]|status|report|off}" ;;
     esac ;;
   -h|--help|help) sed -n '2,/^set -uo pipefail/p' "$0" | sed '/^set -uo pipefail/d; s/^#\s\?//' ;;
   *) err "usage: pi-tier {on|off|status|set-fast|set-hunter|set-flagship|set-coordinator|set-agent|clear-agent|hybrid|amd-fallback|coord-health|concurrency|stall-watch}";;

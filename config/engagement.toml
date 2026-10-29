@@ -1,0 +1,14 @@
+# config/engagement.toml — WHO/WHAT this harness is currently hunting.
+#
+# This committed file is a GENERIC TEMPLATE. Do not put a real engagement here.
+# Instead copy it to config/engagement.local.toml (git-ignored) and edit that —
+# the local file overrides this one. $PIHUNT_PROGRAM overrides both, per-shell.
+#
+# Consumed by lib/pihunt-common.sh (pihunt_program / pihunt_engagement_get), which
+# every tool uses instead of a hardcoded program slug.
+
+[engagement]
+program    = "example-program"   # program slug; drives reports/<program>/ and PIHUNT_PROGRAM
+platform   = "intigriti"         # intigriti | hackerone | yeswehack | bugcrowd | private
+researcher = "your-handle"       # your researcher handle on the platform
+floor      = "HIGH"              # minimum severity to chase: LOW | MEDIUM | HIGH | CRITICAL

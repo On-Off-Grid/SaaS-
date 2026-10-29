@@ -28,7 +28,7 @@ Usage:
   pihunt-gadgets triggers [--program P]   which re-arm triggers are ARMED vs WAITING
   pihunt-gadgets check    [--program P]   exit 10 if any trigger is ARMED (for recon)
   pihunt-gadgets report   [--program P]   write structured-recon/gadgets-report.md
-Default program: digitalocean (or $PIHUNT_PROGRAM).
+Default program: from config/engagement.toml (or $PIHUNT_PROGRAM / --program).
 """
 import json
 import os
@@ -41,7 +41,7 @@ def _find_root():
     # to the parent of the script's bin/ dir (repo-relative invocation).
     d = os.getcwd()
     while True:
-        if os.path.isdir(os.path.join(d, "reports")):
+        if os.path.isdir(os.path.join(d, "reports")) or os.path.exists(os.path.join(d, ".pihunt-root")):
             return d
         p = os.path.dirname(d)
         if p == d:
@@ -52,11 +52,29 @@ def _find_root():
 ROOT = _find_root()
 
 
+def _engagement_program():
+    # Program slug from the TOML engagement config (local override wins), so a
+    # cloned harness carries its own engagement instead of a hardcoded default.
+    import tomllib
+    for name in ("engagement.local.toml", "engagement.toml"):
+        p = os.path.join(ROOT, "config", name)
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p, "rb") as fh:
+                eng = tomllib.load(fh).get("engagement", {}) or {}
+        except Exception:
+            continue
+        if eng.get("program"):
+            return str(eng["program"])
+    return None
+
+
 def program(argv):
     for i, a in enumerate(argv):
         if a == "--program" and i + 1 < len(argv):
             return argv[i + 1]
-    return os.environ.get("PIHUNT_PROGRAM", "digitalocean")
+    return os.environ.get("PIHUNT_PROGRAM") or _engagement_program() or "example-program"
 
 
 def recon_dir(prog):

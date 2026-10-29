@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+# pihunt-missions — extract subagent missions + response times from a pi coordinator transcript.
+# Subagents run IN-PROCESS (piolium agent-runner), so they have no own process/transcript; the only
+# reliable source is the coordinator's session jsonl, where each delegation is a toolCall name="subagent"
+# (arguments.agent = the mission) linked to its toolResult by call id. Duration = result_ts - call_ts.
+#
+# Usage: python3 -I pihunt-missions <transcript.jsonl> <state.json> <log.jsonl> <run_id>
+# Emits NEW events to <log.jsonl> (deduped via <state.json>): {"ev":"dispatch",mission,call,ts} and
+# {"ev":"mission_done",mission,call,resp_s,ts}. Idempotent — safe to call every tick.
+import json, sys, os, time
+
+def epoch(s):
+    if isinstance(s, (int, float)):            # epoch ms or s
+        return int(s/1000) if s > 1e12 else int(s)
+    try:
+        return int(time.mktime(time.strptime(str(s)[:19], "%Y-%m-%dT%H:%M:%S")))
+    except Exception:
+        return 0
+
+def main():
+    if len(sys.argv) < 5:
+        return
+    transcript, state_f, log_f, run = sys.argv[1:5]
+    seen, pend = set(), {}
+    if os.path.exists(state_f):
+        try:
+            d = json.load(open(state_f)); seen = set(d.get("seen", [])); pend = {k: tuple(v) for k, v in d.get("pend", {}).items()}
+        except Exception:
+            pass
+    if not os.path.exists(transcript):
+        return
+    events = []
+
+    def find_agents(x):
+        # deep-search the toolCall's argument containers for every "agent" value,
+        # so ensemble {agent}, swarm/parallel [{agent,task}...] all resolve (not just top-level agent)
+        found, st = [], [x.get(k) for k in ("arguments", "args", "input", "parameters") if isinstance(x.get(k), (dict, list))]
+        while st:
+            n = st.pop()
+            if isinstance(n, dict):
+                a = n.get("agent")
+                if isinstance(a, str) and a:
+                    found.append(a)
+                st.extend(n.values())
+            elif isinstance(n, list):
+                st.extend(n)
+        uniq, s = [], set()
+        for a in found:
+            if a not in s:
+                s.add(a); uniq.append(a)
+        return ",".join(uniq)
+
+    def walk(x, ts):
+        stack = [x]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, dict):
+                nm = n.get("name") or n.get("toolName")
+                if n.get("type") == "toolCall" and nm == "subagent":
+                    cid = n.get("id") or n.get("callId")
+                    ag = find_agents(n) or "unknown"
+                    if cid and cid not in seen and cid not in pend:
+                        pend[cid] = (ag, ts); events.append(("dispatch", cid, ag, ts, None))
+                if (n.get("role") == "toolResult" or n.get("type") == "toolResult") and nm == "subagent":
+                    cid = n.get("toolCallId") or n.get("callId") or n.get("id")
+                    if cid in pend:
+                        ag, start = pend.pop(cid); seen.add(cid)
+                        events.append(("done", cid, ag, ts, max(0, epoch(ts) - epoch(start))))
+                for v in n.values():
+                    stack.append(v)
+            elif isinstance(n, list):
+                stack.extend(n)
+
+    for ln in open(transcript, errors="ignore"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        walk(rec.get("message", rec), rec.get("timestamp"))
+
+    with open(log_f, "a") as f:
+        for ev, cid, ag, ts, dur in events:
+            if ev == "dispatch":
+                f.write(json.dumps({"ts": ts, "ev": "dispatch", "run": run, "mission": ag, "call": cid}) + "\n")
+            else:
+                f.write(json.dumps({"ts": ts, "ev": "mission_done", "run": run, "mission": ag, "call": cid, "resp_s": dur}) + "\n")
+    json.dump({"seen": list(seen)[-1000:], "pend": {k: list(v) for k, v in pend.items()}}, open(state_f, "w"))
+
+if __name__ == "__main__":
+    main()

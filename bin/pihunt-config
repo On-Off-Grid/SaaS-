@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""pihunt-config — compile config/*.toml into the harness's runtime artifacts.
+
+The config/ layer (providers.toml, tiers.toml, machines.toml, engagement.toml) is the
+single source of truth. This tool validates it and generates the derived artifacts the
+runtime reads, so the old three-copies-that-drift problem can't recur.
+
+Subcommands:
+  validate                 check config coherence; exit non-zero on error
+  show      [--machine M]   print the resolved config (providers, tiers, machine)
+  tiers-json               print {tiers, agents} as JSON (consumed by prompt-build)
+  active-machine           print the resolved machine profile name (--machine >
+                           $PIHUNT_MACHINE > machines.local.toml `active` > default)
+  build     [--machine M]   regenerate the derived artifacts:
+            [--dry]           * pi-agent/models.json   (managed providers; dormant preserved)
+                              * build/tier-defaults.sh (pi-tier tier defaults + CONC_* overlay)
+                              * build/pihunt-tuning.env (machine subagent tuning)
+                            --dry prints a summary and writes nothing.
+
+Machine profile: --machine, else $PIHUNT_MACHINE, else "default".
+Requires python3 stdlib tomllib (3.11+). Writes only inside the repo; the installer
+deploys build/* into ~/.pi. Never prints secret values.
+"""
+import json
+import os
+import sys
+import datetime
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.exit("pihunt-config: needs python 3.11+ (tomllib). Found " + sys.version.split()[0])
+
+
+def find_root():
+    env = os.environ.get("PIHUNT_REPO")
+    if env and os.path.isdir(env):
+        return env
+    d = os.getcwd()
+    while True:
+        if os.path.exists(os.path.join(d, ".pihunt-root")) or os.path.isdir(os.path.join(d, "reports")):
+            return d
+        p = os.path.dirname(d)
+        if p == d:
+            return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        d = p
+
+
+ROOT = find_root()
+CONFIG = os.path.join(ROOT, "config")
+MODELS_JSON = os.path.join(ROOT, "pi-agent", "models.json")
+BUILD_DIR = os.path.join(ROOT, "build")
+
+
+def load(name):
+    path = os.path.join(CONFIG, name)
+    if not os.path.exists(path):
+        return {}, path
+    with open(path, "rb") as fh:
+        return tomllib.load(fh), path
+
+
+def c(s, code):  # color
+    return s if not sys.stdout.isatty() else f"\033[{code}m{s}\033[0m"
+
+
+def ok(s):   print("  " + c("✓", "1;32") + " " + s)
+def warn(s): print("  " + c("!", "1;33") + " " + s)
+def err(s):  print("  " + c("✗ " + s, "1;31"))
+
+
+def split_ref(ref):
+    """'amd-radeon/DeepSeek-V4.1-Flash:high' -> (provider, model, thinking)."""
+    prov, _, rest = ref.partition("/")
+    model, _, thinking = rest.partition(":")
+    return prov, model, (thinking or None)
+
+
+# ------------------------------------------------------------------ load config
+def read_all():
+    providers, _ = load("providers.toml")
+    tiers, _ = load("tiers.toml")
+    machines, _ = load("machines.toml")
+    # machines.local.toml (git-ignored, per-machine): a top-level `active = "<name>"`
+    # names this box's profile, and any profile tables override/extend the committed ones.
+    mlocal, _ = load("machines.local.toml")
+    active = mlocal.pop("active", None) if isinstance(mlocal, dict) else None
+    for name, prof in (mlocal or {}).items():
+        if isinstance(prof, dict):
+            merged = dict(machines.get(name, {}))
+            merged.update(prof)
+            machines[name] = merged
+    engagement = {}
+    for n in ("engagement.local.toml", "engagement.toml"):
+        d, _ = load(n)
+        if d:
+            engagement = d
+            break
+    return {
+        "providers": providers.get("providers", {}),
+        "tiers": tiers.get("tiers", {}),
+        "agents": tiers.get("agents", {}),
+        "machines": machines,
+        "machine_active": active,
+        "engagement": engagement.get("engagement", {}),
+    }
+
+
+def machine_profile(machines, name):
+    if name in machines:
+        return name, machines[name]
+    if "default" in machines:
+        return "default", machines["default"]
+    return None, None
+
+
+# --------------------------------------------------------------------- validate
+def cmd_validate(cfg):
+    providers, tiers, agents, machines = cfg["providers"], cfg["tiers"], cfg["agents"], cfg["machines"]
+    errors = 0
+
+    if not providers:
+        err("no providers declared in config/providers.toml"); errors += 1
+    for name, p in providers.items():
+        managed = p.get("managed", True)
+        builtin = p.get("builtin", False)
+        if managed and not builtin:
+            for req in ("base_url", "api", "key_env"):
+                if req not in p:
+                    err(f"provider '{name}': managed provider missing '{req}'"); errors += 1
+        kf = p.get("key_file")
+        if kf:
+            tmpl = os.path.join(CONFIG, "secrets", kf + ".example")
+            if not os.path.exists(tmpl):
+                warn(f"provider '{name}': no secret template config/secrets/{kf}.example")
+        if p.get("probe") and not p.get("health_url"):
+            warn(f"provider '{name}': probe=true but no health_url")
+
+    # tier model refs resolve to a declared provider
+    tier_refs = [(k, v) for k, v in tiers.items() if isinstance(v, str)]
+    tier_refs += [("coordinator_fallbacks", r) for r in tiers.get("coordinator_fallbacks", [])]
+    for tier, ref in tier_refs:
+        prov, model, _ = split_ref(ref)
+        if prov not in providers:
+            err(f"tier '{tier}': provider '{prov}' (in '{ref}') not declared in providers.toml"); errors += 1
+            continue
+        p = providers[prov]
+        if p.get("managed", True) and not p.get("builtin", False):
+            ids = {m.get("id") for m in p.get("models", [])}
+            if model not in ids:
+                err(f"tier '{tier}': model '{model}' not in managed provider '{prov}' models"); errors += 1
+
+    # machine profiles sane
+    if not machines:
+        err("no machine profiles in config/machines.toml"); errors += 1
+    for mname, m in machines.items():
+        for req in ("max_concurrency", "conc_high", "conc_mid", "conc_base"):
+            if req not in m:
+                err(f"machine '{mname}': missing '{req}'"); errors += 1
+
+    # the per-machine active selection (machines.local.toml) must name a real profile
+    active = cfg.get("machine_active")
+    if active and active not in machines:
+        err(f"machines.local.toml active='{active}' is not a defined machine profile"); errors += 1
+
+    # agent tier lists are strings
+    for grp in ("elite", "fast"):
+        for a in agents.get(grp, []):
+            if not isinstance(a, str):
+                err(f"agents.{grp}: non-string entry {a!r}"); errors += 1
+
+    if errors:
+        print(); err(f"validate: {errors} error(s)"); return 1
+    ok("validate: config is coherent")
+    return 0
+
+
+# ------------------------------------------------------------------------- show
+def cmd_show(cfg, machine):
+    eng = cfg["engagement"]
+    print("# engagement")
+    for k in ("program", "platform", "researcher", "floor"):
+        print(f"  {k:12}= {eng.get(k, '')}")
+    print("\n# providers")
+    for name, p in cfg["providers"].items():
+        flags = []
+        if p.get("builtin"): flags.append("builtin")
+        flags.append("managed" if p.get("managed", True) else "preserved")
+        if p.get("probe"): flags.append("probed")
+        if p.get("dormant"): flags.append("dormant")
+        nmodels = len(p.get("models", []))
+        print(f"  {name:16} [{', '.join(flags)}]" + (f"  {nmodels} model(s)" if nmodels else ""))
+    print("\n# tiers")
+    for k, v in cfg["tiers"].items():
+        if isinstance(v, str):
+            print(f"  {k:12}= {v}")
+    for r in cfg["tiers"].get("coordinator_fallbacks", []):
+        print(f"  {'fallback':12}= {r}")
+    mname, m = machine_profile(cfg["machines"], machine)
+    print(f"\n# machine profile: {mname}")
+    if m:
+        for k in ("cores", "ram_gb", "max_concurrency", "max_queue", "ram_floor_mb", "conc_high", "conc_mid", "conc_base"):
+            if k in m:
+                print(f"  {k:16}= {m[k]}")
+    return 0
+
+
+# ------------------------------------------------------------------------ build
+def gen_models_json(providers):
+    """Regenerate pi-agent/models.json: managed non-builtin providers from config;
+    everything else (dormant/undeclared) preserved from the existing file, in order."""
+    existing = {}
+    if os.path.exists(MODELS_JSON):
+        with open(MODELS_JSON, "rb") as fh:
+            existing = json.load(fh).get("providers", {})
+
+    def block(p):
+        b = {"baseUrl": p["base_url"], "api": p["api"], "apiKey": "$" + p["key_env"]}
+        b["models"] = [dict(m) for m in p.get("models", [])]
+        if "compat" in p:
+            b["compat"] = dict(p["compat"])
+        return b
+
+    out = {}
+    managed_written = []
+    # preserve original order; replace managed non-builtin blocks in place
+    for name, cur in existing.items():
+        p = providers.get(name)
+        if p and p.get("managed", True) and not p.get("builtin", False):
+            out[name] = block(p); managed_written.append(name)
+        else:
+            out[name] = cur  # preserved (dormant / unmanaged / undeclared)
+    # append managed providers not already present
+    for name, p in providers.items():
+        if p.get("builtin", False) or not p.get("managed", True):
+            continue
+        if name not in out:
+            out[name] = block(p); managed_written.append(name)
+    return {"providers": out}, managed_written, list(existing.keys())
+
+
+def gen_tier_defaults(tiers, agents, mname, m, machine_req):
+    L = []
+    L.append("# Generated by `pihunt-config build` on " + datetime.date.today().isoformat() + " — DO NOT EDIT.")
+    L.append("# Source: config/tiers.toml + config/machines.toml (machine=" + str(mname) + ").")
+    L.append("# pi-tier sources this as an overlay; its built-in constants are the fallback.")
+    L.append(f'FAST_DEFAULT="{tiers.get("fast", "")}"')
+    L.append(f'HUNTER_DEFAULT="{tiers.get("hunter", "")}"')
+    L.append(f'FLAGSHIP_DEFAULT="{tiers.get("flagship", "")}"')
+    L.append(f'ELITE_DEFAULT="{tiers.get("elite", "")}"')
+    L.append(f'COORD_DEFAULT="{tiers.get("coordinator", "")}"')
+    L.append("ELITE_AGENTS=(" + " ".join(agents.get("elite", [])) + ")")
+    L.append("FAST_AGENTS=(" + " ".join(agents.get("fast", [])) + ")")
+    fb = " ".join('"%s"' % r for r in tiers.get("coordinator_fallbacks", []))
+    L.append("COORD_FALLBACKS=(" + fb + ")")
+    L.append(f'CONC_HIGH={m.get("conc_high", 3)}')
+    L.append(f'CONC_MID={m.get("conc_mid", 2)}')
+    L.append(f'CONC_BASE={m.get("conc_base", 1)}')
+    L.append(f'PIHUNT_MACHINE_PROFILE="{mname}"')
+    L.append(f'PIHUNT_MACHINE_REQUESTED="{machine_req}"')
+    return "\n".join(L) + "\n"
+
+
+def gen_tuning_env(mname, m):
+    base = m.get("conc_base", 1)
+    ceil = m.get("max_concurrency", base)
+    return (
+        f"# Generated by `pihunt-config build` (machine={mname}) — DO NOT EDIT.\n"
+        f"# Installer merges this into ~/.pi/secrets/pihunt-tuning.env. pi-tier scales\n"
+        f"# PI_SUBAGENT_MAX_CONCURRENCY up to the machine ceiling ({ceil}) by live quota.\n"
+        f"export PI_SUBAGENT_MAX_CONCURRENCY={base}\n"
+        f"export PI_SUBAGENT_MAX_QUEUE={m.get('max_queue', base * 2)}\n"
+        f"export PI_SUBAGENT_RAM_FLOOR_MB={m.get('ram_floor_mb', 1500)}\n"
+    )
+
+
+def gen_probe_table(providers):
+    """Shell probe table for pi-tier's generic data-driven health probe."""
+    probed = [(n, p) for n, p in providers.items() if p.get("probe")]
+    L = ["",
+         "# Provider health-probe table (providers.toml probe=true) — pi-tier's generic",
+         "# prober (provider_usable / conc_providers) reads this; names drive the up-count.",
+         'PIHUNT_PROBE_PROVIDERS="' + " ".join(n for n, _ in probed) + '"']
+
+    def arr(var, key, default=""):
+        items = " ".join('["%s"]="%s"' % (n, str(p.get(key, default))) for n, p in probed)
+        return "declare -gA %s=( %s )" % (var, items)
+
+    L.append(arr("PIHUNT_PROBE_KEYFILE", "key_file"))
+    L.append(arr("PIHUNT_PROBE_KEYENV", "key_env"))
+    L.append(arr("PIHUNT_PROBE_URL", "health_url"))
+    L.append(arr("PIHUNT_PROBE_MODEL", "probe_model"))
+    L.append(arr("PIHUNT_PROBE_OKCODES", "ok_codes", "200"))
+    return "\n".join(L) + "\n"
+
+
+def cmd_build(cfg, machine, dry):
+    mname, m = machine_profile(cfg["machines"], machine)
+    if not m:
+        err("build: no machine profile (and no [default]) in config/machines.toml"); return 1
+
+    models, written, order = gen_models_json(cfg["providers"])
+    td = gen_tier_defaults(cfg["tiers"], cfg["agents"], mname, m, machine) + gen_probe_table(cfg["providers"])
+    tune = gen_tuning_env(mname, m)
+    models_text = json.dumps(models, indent=2, ensure_ascii=False) + "\n"
+
+    if dry:
+        ok(f"[dry] machine profile: {mname}")
+        ok(f"[dry] models.json: regenerate {written} ; preserve {[p for p in order if p not in written]}")
+        ok(f"[dry] would write pi-agent/models.json ({len(models_text)} bytes)")
+        ok("[dry] would write build/tier-defaults.sh and build/pihunt-tuning.env")
+        print("\n--- build/tier-defaults.sh ---\n" + td)
+        return 0
+
+    os.makedirs(BUILD_DIR, exist_ok=True)
+    with open(MODELS_JSON, "w") as fh:
+        fh.write(models_text)
+    ok(f"wrote pi-agent/models.json (regenerated {len(written)}, preserved {len(order) - len(written)})")
+    with open(os.path.join(BUILD_DIR, "tier-defaults.sh"), "w") as fh:
+        fh.write(td)
+    ok("wrote build/tier-defaults.sh (deploy -> ~/.pi/agent/.tier-defaults.sh)")
+    with open(os.path.join(BUILD_DIR, "pihunt-tuning.env"), "w") as fh:
+        fh.write(tune)
+    ok(f"wrote build/pihunt-tuning.env (machine={mname})")
+    return 0
+
+
+# -------------------------------------------------------------------------- main
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__); return 0
+    cmd = argv[0]
+    dry = "--dry" in argv
+    cfg = read_all()
+    # machine resolution: --machine > $PIHUNT_MACHINE > machines.local active > "default"
+    machine = None
+    if "--machine" in argv:
+        i = argv.index("--machine")
+        if i + 1 < len(argv):
+            machine = argv[i + 1]
+    machine = machine or os.environ.get("PIHUNT_MACHINE") or cfg.get("machine_active") or "default"
+    if cmd == "active-machine":
+        print(machine)
+        return 0
+    if cmd == "validate":
+        return cmd_validate(cfg)
+    if cmd == "show":
+        return cmd_show(cfg, machine)
+    if cmd == "build":
+        return cmd_build(cfg, machine, dry)
+    if cmd == "tiers-json":
+        print(json.dumps({"tiers": cfg["tiers"], "agents": cfg["agents"]}))
+        return 0
+    err(f"unknown subcommand: {cmd}")
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

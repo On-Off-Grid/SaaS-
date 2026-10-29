@@ -2,7 +2,7 @@
 # =============================================================================
 # pi-hunt bootstrap — the easy, one-command installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/USER/pi-hunt/main/bootstrap.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/YOUR-GITHUB-USER/pi-hunt/main/bootstrap.sh | bash
 #   # or, from a clone:
 #   ./bootstrap.sh
 #
@@ -18,8 +18,9 @@
 # =============================================================================
 set -uo pipefail
 
-# Replace <user> with your GitHub handle (or your fork) before sharing the installer.
-REPO_URL_DEFAULT="https://github.com/<user>/pi-hunt.git"
+# Clone URL: override per-run with --repo <url> or $PIHUNT_REPO_URL. Edit the
+# fallback below (or your fork) before sharing the curl-pipe installer.
+REPO_URL_DEFAULT="${PIHUNT_REPO_URL:-https://github.com/YOUR-GITHUB-USER/pi-hunt.git}"
 WITH_EXTRAS=0; DRY=0; REPO_URL="$REPO_URL_DEFAULT"
 while [ $# -gt 0 ]; do case "$1" in
   --with-extras) WITH_EXTRAS=1;;

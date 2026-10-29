@@ -1,0 +1,52 @@
+# config/machines.toml — named machine profiles for local-agent concurrency.
+#
+# These are GENERIC, shareable profiles. The profile THIS box uses — and any
+# box-specific numbers — belong in config/machines.local.toml (git-ignored):
+#     active = "desktop"
+#     [desktop]            # override only the keys that differ on this machine
+#     cores = 12
+#     ram_gb = 15
+# Resolution: --machine > $PIHUNT_MACHINE > machines.local.toml `active` > [default].
+# pi-tier still scales concurrency to how many LLM providers are usable right now,
+# but never above the resolved profile's ceiling, and the conc_high/mid/base values
+# replace pi-tier's old hardcoded 6/4/3.
+#
+# `pihunt-config build --machine <name>` writes these into ~/.pi/agent/.tier-defaults.sh
+# (CONC_HIGH/MID/BASE) and seeds ~/.pi/secrets/pihunt-tuning.env (queue, RAM floor).
+#
+# Fields:
+#   cores, ram_gb        informational (document the box; not probed)
+#   max_concurrency      hard ceiling on simultaneous subagents
+#   max_queue            queued subagents beyond the concurrency limit
+#   ram_floor_mb         runner refuses to spawn when free RAM drops below this
+#   conc_high/mid/base   concurrency when 3 / 2 / (1 openrouter-only or 0) providers are up
+
+[default]            # safe fallback for an unknown box: 4 cores / 8 GB
+cores = 4
+ram_gb = 8
+max_concurrency = 3
+max_queue = 6
+ram_floor_mb = 1500
+conc_high = 3
+conc_mid = 2
+conc_base = 1
+
+[desktop]            # a typical workstation (put exact specs in machines.local.toml)
+cores = 12
+ram_gb = 16
+max_concurrency = 6
+max_queue = 12
+ram_floor_mb = 1500
+conc_high = 6
+conc_mid = 4
+conc_base = 3
+
+[laptop]             # a smaller mobile box; tune to your hardware
+cores = 8
+ram_gb = 16
+max_concurrency = 4
+max_queue = 8
+ram_floor_mb = 2000
+conc_high = 4
+conc_mid = 3
+conc_base = 2

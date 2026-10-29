@@ -1,0 +1,6 @@
+# This file marks the pi-hunt repository root.
+# The CLI tools (via lib/pihunt-common.sh :: pihunt_repo_root) walk up from the
+# working directory until they find this marker, so they work bare-on-PATH from
+# the repo or any subdirectory — and from a fresh clone before reports/ exists.
+# Do not delete. Content is informational only.
+pihunt-root: true

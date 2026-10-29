@@ -1,0 +1,134 @@
+# config/providers.toml — LLM provider definitions (single source of truth).
+#
+# `pihunt-config build` uses this to:
+#   1. regenerate pi-agent/models.json for every provider with managed=true
+#      (builtin providers like openrouter are NOT written — pi resolves them itself).
+#      Provider blocks already in models.json but NOT declared here, or declared with
+#      managed=false, are PRESERVED untouched (dormant: ollama, freellm, selfhost-vllm,
+#      and the declared-but-unmanaged ones below). So nothing dormant is lost.
+#   2. generate pi-tier's provider health-probe dispatch (which providers to probe,
+#      with what URL / key env / probe model) — replacing pi-tier's hardcoded functions.
+#   3. generate the shell-rc provider-key sourcing list (from each provider's key_file).
+#
+# Add or switch a provider = add/edit a block here (+ its config/secrets/<name>.env),
+# then `pihunt-config build`. Fields per block:
+#   managed      true = models.json block is generated from here; false = preserved as-is
+#   builtin      true = pi resolves it at runtime; not written to models.json
+#   probe        true = pi-tier health-probes it (failover + concurrency scaling)
+#   base_url/api/key_env/compat  mirror the models.json provider fields
+#   key_file     the ~/.pi/secrets/<file> that exports key_env (for the rc source list)
+#   health_url/probe_model       used by the generated health probe
+
+# ---- OpenRouter: paid backbone + coordinator fallback (pi built-in provider) ----
+[providers.openrouter]
+builtin     = true
+managed     = true
+probe       = true
+key_env     = "OPENROUTER_API_KEY"
+key_file    = "openrouter.env"
+health_url  = "https://openrouter.ai/api/v1/chat/completions"
+probe_model = "deepseek/deepseek-v4.1-flash"
+ok_codes    = "200 400"   # 400 = endpoint reachable (key/host OK); default is "200"
+
+# ---- AMD Radeon Cloud: free DeepSeek (default hunter + coordinator) ----
+[providers.amd-radeon]
+managed     = true
+probe       = true
+base_url    = "https://developer.amd.com.cn/radeon/api/v1"
+api         = "openai-completions"
+key_env     = "RADEON_API_KEY"
+key_file    = "amd.env"
+health_url  = "https://developer.amd.com.cn/radeon/api/v1/chat/completions"
+probe_model = "DeepSeek-V4.1-Flash"
+compat      = { supportsStore = false, supportsDeveloperRole = false, supportsReasoningEffort = false, maxTokensField = "max_tokens", supportsStrictMode = false }
+
+  [[providers.amd-radeon.models]]
+  id = "DeepSeek-V4-Flash"
+  name = "DeepSeek V4 Flash (AMD Radeon Cloud)"
+  reasoning = false
+  input = ["text"]
+  contextWindow = 1048576
+  maxTokens = 8192
+  cost = { input = 0, output = 0, cacheRead = 0, cacheWrite = 0 }
+
+  [[providers.amd-radeon.models]]
+  id = "DeepSeek-V4.1-Flash"
+  name = "DeepSeek V4.1 Flash (AMD Radeon)"
+  reasoning = true
+  input = ["text", "image"]
+  contextWindow = 98304
+  maxTokens = 32768
+  cost = { input = 0.28, output = 0.56, cacheRead = 0.0056, cacheWrite = 0 }
+
+# ---- Mistral direct: mechanical / fast tier ----
+[providers.mistral-direct]
+managed     = true
+probe       = false
+base_url    = "https://api.mistral.ai/v1"
+api         = "openai-completions"
+key_env     = "MISTRAL_API_KEY"
+key_file    = "direct_llm.env"
+compat      = { supportsStore = false, supportsDeveloperRole = false, supportsReasoningEffort = false }
+
+  [[providers.mistral-direct.models]]
+  id = "codestral-latest"
+  name = "Codestral Latest (Mistral, free tier)"
+  reasoning = false
+  input = ["text"]
+  contextWindow = 131072
+  maxTokens = 8192
+  cost = { input = 0, output = 0, cacheRead = 0, cacheWrite = 0 }
+
+  [[providers.mistral-direct.models]]
+  id = "codestral-2508"
+  name = "Codestral 2508 (Mistral, free tier)"
+  reasoning = false
+  input = ["text"]
+  contextWindow = 131072
+  maxTokens = 8192
+  cost = { input = 0, output = 0, cacheRead = 0, cacheWrite = 0 }
+
+  [[providers.mistral-direct.models]]
+  id = "magistral-small-latest"
+  name = "Magistral Small (Mistral, free tier)"
+  reasoning = false
+  input = ["text"]
+  contextWindow = 32768
+  maxTokens = 8192
+  cost = { input = 0, output = 0, cacheRead = 0, cacheWrite = 0 }
+
+  [[providers.mistral-direct.models]]
+  id = "mistral-code-latest"
+  name = "Mistral Code (Mistral, free tier)"
+  reasoning = false
+  input = ["text"]
+  contextWindow = 262144
+  maxTokens = 8192
+  cost = { input = 0, output = 0, cacheRead = 0, cacheWrite = 0 }
+
+# ---- Declared but UNMANAGED (failover / dormant): models.json blocks preserved as-is. ----
+# They carry probe/key metadata only so pi-tier's dispatch + the rc key list know them.
+
+[providers.groq-direct]
+managed     = false
+probe       = false
+key_env     = "GROQ_API_KEY"
+key_file    = "groq.env"
+health_url  = "https://api.groq.com/openai/v1/chat/completions"
+probe_model = "qwen/qwen3.8-27b"
+
+[providers.google-direct]
+managed     = false
+probe       = false
+key_env     = "GOOGLE_AI_KEY"
+key_file    = "direct_llm.env"
+
+[providers.kimi-coding]
+managed     = false
+probe       = false
+dormant     = true
+key_env     = "KIMI_API_KEY"
+key_file    = "kimi.env"
+health_url  = "https://api.kimi.com/coding/v1/chat/completions"
+probe_model = "k3.1-pro"
+ok_codes    = "200 400"

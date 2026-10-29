@@ -24,6 +24,7 @@ PI_PKG="@earendil-works/pi-coding-agent@0.79.0"
 DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
 DRYARG=""; [ "$DRY" = 1 ] && DRYARG="--dry-run"
 DRYNOTE=""; [ "$DRY" = 1 ] && DRYNOTE=" (dry-run — nothing changed)"
+MACHINE="${PIHUNT_MACHINE:-default}"   # machine profile for pihunt-config build (config/machines.toml)
 
 c(){ printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 ok(){ printf '   \033[1;32m✓\033[0m %s\n' "$*"; }
@@ -43,6 +44,19 @@ echo "   node $(node -v) | npm $(npm -v) | $(python3 -V) | $USER_NAME@$(hostname
 NODE_MAJ="$(node -v | sed 's/v\([0-9]*\).*/\1/')"; [ "$NODE_MAJ" -lt 22 ] 2>/dev/null && warn "node < 22 — pi 0.79.0 expects Node 22+."
 command -v java >/dev/null && ok "java present (burp MCP)" || warn "java NOT found — needed for the burp MCP proxy jar."
 { command -v chromium >/dev/null || [ -x /usr/bin/chromium ] || command -v google-chrome >/dev/null; } && ok "chromium present (browser-live)" || warn "chromium NOT found — browser-live needs /usr/bin/chromium (or set BROWSER_LIVE_CHROME_BIN)."
+
+c "0/9  config: validate + compile (config/*.toml -> models.json + tier defaults)"
+if [ -f "$SRC/bin/pihunt-config" ]; then
+  # per-machine profile selection (git-ignored); seed active=default if this box has none
+  if [ ! -f "$SRC/config/machines.local.toml" ]; then
+    if [ "$DRY" = 1 ]; then printf '   [dry] seed config/machines.local.toml (active=default)\n'
+    else printf '%s\n' '# per-machine profile (git-ignored). Set active to a profile in machines.toml.' 'active = "default"' > "$SRC/config/machines.local.toml" && warn "seeded config/machines.local.toml (active=default) — set it to laptop/desktop for this box"; fi
+  fi
+  MACHINE="$(python3 "$SRC/bin/pihunt-config" active-machine 2>/dev/null || echo "$MACHINE")"
+  python3 "$SRC/bin/pihunt-config" validate || { warn "config validate FAILED — fix config/*.toml and re-run"; [ "$DRY" = 0 ] && exit 1; }
+  if [ "$DRY" = 1 ]; then python3 "$SRC/bin/pihunt-config" build --machine "$MACHINE" --dry >/dev/null && ok "[dry] would compile config (machine=$MACHINE)"
+  else python3 "$SRC/bin/pihunt-config" build --machine "$MACHINE" >/dev/null && ok "compiled config (machine=$MACHINE) -> models.json + build/"; fi
+else warn "bin/pihunt-config not bundled — skipping config compile (models.json used as-is)"; fi
 
 c "1/9  pi runtime  ($PI_PKG)"
 if [ "$(pi --version 2>/dev/null)" = "0.79.0" ]; then ok "pi 0.79.0 already installed"; else
@@ -127,8 +141,14 @@ else warn "rag/install-rag.sh not bundled — skipping RAG"; fi
 
 c "6/7  launchers  ->  $H/.local/bin"
 run "mkdir -p '$H/.local/bin'"
-for l in pi-hunt pi-tier pihunt-gadgets pihunt-authz pihunt-triage hunt-session hunt-brief submission-shots; do [ -f "$SRC/bin/$l" ] || continue; bk "$H/.local/bin/$l"; run "cp -p '$SRC/bin/$l' '$H/.local/bin/$l'"; rehome "$H/.local/bin/$l"; run "chmod +x '$H/.local/bin/$l'"; done
-ok "pi-hunt (Kimi Code), pi-tier (cost tiering), hunt-session + hunt-brief (session routine)"
+for l in pi-hunt pi-tier pihunt-config pihunt-gadgets pihunt-authz pihunt-triage pihunt-missions pihunt-profile pihunt-watchdog hunt-session hunt-brief submission-shots; do [ -f "$SRC/bin/$l" ] || continue; bk "$H/.local/bin/$l"; run "cp -p '$SRC/bin/$l' '$H/.local/bin/$l'"; rehome "$H/.local/bin/$l"; run "chmod +x '$H/.local/bin/$l'"; done
+ok "launchers: pi-hunt, pi-tier (cost tiering), hunt-session + hunt-brief (session routine), gadgets/authz/triage, missions/profile/watchdog (observability)"
+# shared bash lib the tools source (repo-root discovery, engagement/program resolution, TOML reads)
+if [ -d "$SRC/lib" ]; then
+  run "mkdir -p '$H/.local/lib'"
+  for lf in "$SRC"/lib/*.sh; do [ -f "$lf" ] || continue; bk "$H/.local/lib/$(basename "$lf")"; run "cp -p '$lf' '$H/.local/lib/'"; done
+  ok "shared lib -> ~/.local/lib (pihunt-common.sh) — ~/.local/bin/<tool>/../lib resolves"
+fi
 # continuous-recon engine + scheduler + registry helper
 if [ -d "$SRC/recon" ]; then
   run "cp -p '$SRC/recon/recon-engine.sh' '$H/.local/bin/pihunt-recon'" && run "chmod +x '$H/.local/bin/pihunt-recon'"
@@ -163,6 +183,40 @@ if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/nu
   [ -f "$H/.config/systemd/user/pihunt-cve.timer" ] && run "systemctl --user enable --now pihunt-cve.timer" && ok "cve-freshness timer enabled (daily KEV/NVD/EPSS refresh)"
   run "loginctl enable-linger '$USER_NAME'" && ok "linger enabled"
 else warn "systemd --user unavailable. The optional recon/cve timers were not enabled."; fi
+
+c "6b2/7  config: seed secret + engagement templates (non-destructive)"
+run "mkdir -p '$H/.pi/secrets'"
+if [ -d "$SRC/config/secrets" ]; then
+  for ex in "$SRC"/config/secrets/*.env.example; do
+    [ -f "$ex" ] || continue
+    [ "$(basename "$ex")" = "pihunt-tuning.env.example" ] && continue   # machine-specific; handled below
+    dst="$H/.pi/secrets/$(basename "${ex%.example}")"
+    if [ -e "$dst" ]; then ok "kept existing $(basename "$dst")"
+    elif [ "$DRY" = 1 ]; then printf '   [dry] seed %s from template\n' "$dst"
+    else cp -p "$ex" "$dst" && warn "seeded $(basename "$dst") — FILL IN its key(s) before launching"; fi
+  done
+  run "chmod 700 '$H/.pi/secrets'"
+fi
+if [ -f "$SRC/config/engagement.toml" ] && [ ! -f "$SRC/config/engagement.local.toml" ]; then
+  if [ "$DRY" = 1 ]; then printf '   [dry] seed config/engagement.local.toml from template\n'
+  else cp -p "$SRC/config/engagement.toml" "$SRC/config/engagement.local.toml" && warn "seeded config/engagement.local.toml — EDIT it: set program/platform/researcher"; fi
+fi
+
+# machine subagent tuning: prefer the machine-specific build output, else the template
+TUNE_DST="$H/.pi/secrets/pihunt-tuning.env"
+if [ -e "$TUNE_DST" ]; then ok "kept existing pihunt-tuning.env"
+elif [ -f "$SRC/build/pihunt-tuning.env" ]; then
+  if [ "$DRY" = 1 ]; then printf '   [dry] seed pihunt-tuning.env from build (machine=%s)\n' "$MACHINE"
+  else cp -p "$SRC/build/pihunt-tuning.env" "$TUNE_DST" && ok "seeded pihunt-tuning.env (machine=$MACHINE)"; fi
+elif [ -f "$SRC/config/secrets/pihunt-tuning.env.example" ]; then
+  if [ "$DRY" = 1 ]; then printf '   [dry] seed pihunt-tuning.env from template\n'
+  else cp -p "$SRC/config/secrets/pihunt-tuning.env.example" "$TUNE_DST" && warn "seeded pihunt-tuning.env from template"; fi
+fi
+# tier-defaults overlay: pi-tier sources this (tier models + CONC_* from the machine profile)
+if [ -f "$SRC/build/tier-defaults.sh" ]; then
+  bk "$H/.pi/agent/.tier-defaults.sh"
+  run "cp -p '$SRC/build/tier-defaults.sh' '$H/.pi/agent/.tier-defaults.sh'" && ok "deployed tier-defaults overlay (.tier-defaults.sh, machine=$MACHINE)"
+fi
 
 c "6c/7  shell env  ->  source LLM provider keys for pi"
 # pi reads provider API keys from the ENVIRONMENT ($OPENROUTER_API_KEY, $RADEON_API_KEY,

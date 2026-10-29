@@ -2,7 +2,7 @@
 .DEFAULT_GOAL := help
 SHELL := /usr/bin/env bash
 
-.PHONY: help install full extras dry rag prompts prompts-check gate-repo gate-selftest skills-manifest hooks token-report tier-on tier-off status uninstall-note
+.PHONY: help install full extras dry rag prompts prompts-check gate-repo gate-selftest skills-manifest hooks token-report tier-on tier-off status uninstall-note clean-baks config-validate config-build config-show
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -22,6 +22,19 @@ gate-selftest: ## Prove the reference gate fails on each defect class
 
 skills-manifest: ## Regenerate skills/manifest.json from the repo skill tree
 	@node bin/skill-manifest.mjs
+
+clean-baks: ## Remove prompt-build backup files (*.bak-<ts>) from the working tree
+	@find . -name '*.bak-*' -not -path './.git/*' -print -delete | sed 's/^/  removed /' || true
+	@echo "clean-baks: done"
+
+config-validate: ## Check config/*.toml coherence (providers/tiers/machines/secrets)
+	@python3 bin/pihunt-config validate
+
+config-build: ## Regenerate models.json + build/ artifacts (PIHUNT_MACHINE=laptop|desktop|default)
+	@python3 bin/pihunt-config build --machine "$${PIHUNT_MACHINE:-default}"
+
+config-show: ## Print the resolved config (engagement, providers, tiers, machine)
+	@python3 bin/pihunt-config show --machine "$${PIHUNT_MACHINE:-default}"
 
 hooks: ## Install the git hooks (committed in .githooks/)
 	@git config core.hooksPath .githooks

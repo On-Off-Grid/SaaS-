@@ -1,0 +1,37 @@
+# config/tiers.toml — model tiers and per-agent tier membership.
+#
+# The source for pi-tier's tier defaults. Each tier maps to a provider/model ref;
+# an agent belongs to one tier, and everything unlisted defaults to `hunter`.
+# `pihunt-config build` writes these into ~/.pi/agent/.tier-defaults.sh, which
+# pi-tier sources as an overlay over its built-in fallbacks. Change a tier's model
+# here, run `pihunt-config build`, and pi-tier picks it up at the next tier apply.
+
+[tiers]
+fast        = "mistral-direct/codestral-latest"          # mechanical agents (cheap, high-volume)
+hunter      = "amd-radeon/DeepSeek-V4.1-Flash"            # default for every unlisted agent
+flagship    = "openrouter/deepseek/deepseek-v4.1-flash"
+elite       = "openrouter/deepseek/deepseek-v4.1-flash"   # was Kimi K3.1 Pro; moved to paid OpenRouter 2026-10-28
+coordinator = "amd-radeon/DeepSeek-V4.1-Flash:high"
+
+# Coordinator failover chain (most-reliable first), each provider/model[:thinking].
+# pi-tier's coord-health watcher stages the first healthy one for the next launch.
+coordinator_fallbacks = [
+  "openrouter/deepseek/deepseek-v4.1-flash:high",
+  "amd-radeon/DeepSeek-V4.1-Flash:high",
+]
+
+[agents]
+# Elite tier: strongest reasoning (was Kimi, now paid OpenRouter).
+elite = ["strict-triager", "hypothesis-redteam"]
+# Fast / mechanical tier: cheap, high-volume, low-judgement.
+fast = [
+  "h1-scope-loader",
+  "intigriti-scope-loader",
+  "yeswehack-scope-loader",
+  "recon",
+  "test-account-manager",
+  "visual-security",
+  "payload-researcher",
+  "wordlist-curator",
+]
+# Everything else is a hunter (the `hunter` default). Membership is "not elite, not fast".

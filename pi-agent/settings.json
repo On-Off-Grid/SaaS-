@@ -23,6 +23,7 @@
       "maxRetries": 0
     }
   },
+  "httpIdleTimeoutMs": 120000,
   "branchSummary": {
     "skipPrompt": true
   },
