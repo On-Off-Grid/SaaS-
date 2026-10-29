@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# pihunt-scope-guard — Claude Code PreToolUse ROE/scope guardrail.
+#
+# WHAT IT IS: a defense-in-depth guardrail against *accidental* out-of-scope
+# network requests during an engagement. Wired in .claude/settings.json as a
+# PreToolUse hook on Bash|WebFetch. It reads the hook event JSON on stdin,
+# extracts target host(s) from the tool input, and compares them to the active
+# engagement's [scope] block (config/engagement.local.toml, via pihunt-common.sh).
+#
+# WHAT IT IS NOT: a security boundary. Per the Claude Code docs, Bash deny-rules
+# are not a boundary, and neither is this — it cannot parse arbitrarily obfuscated
+# shell (sh -c '...', base64, variable indirection, non-URL host forms). It catches
+# honest mistakes and accidental pivots. Layer it UNDER the OS sandbox and Burp's
+# scope_check, never in place of them.
+#
+# BEHAVIOUR (positive-identification-to-block; fails open):
+#   - in_scope empty/unset  -> guard disabled: emit nothing, allow all (never
+#                              breaks an unconfigured clone).
+#   - host in out_of_scope   -> permissionDecision "deny".
+#   - host external + in_scope non-empty + not matched -> "ask" (challenge).
+#   - localhost / private / in-scope / no host found    -> emit nothing (normal flow;
+#                              the guard never auto-APPROVES, so other rules still apply).
+# Any parse error or missing python3 -> emit nothing, exit 0.
+#
+# max_req_per_sec is advisory only (surfaced in the challenge reason); rate is not
+# enforceable from a single pre-call hook — the operator sees the floor in hunt-brief.
+#
+# Override the external-unmatched decision with PIHUNT_SCOPE_GUARD_MODE=deny|ask
+# (default ask).
+
+set -u
+
+# --- locate + source the shared lib (clone or installed layout) ------------
+for __l in "$(dirname "${BASH_SOURCE[0]}")/../lib/pihunt-common.sh" \
+           "$HOME/.local/lib/pihunt-common.sh" \
+           "${PIHUNT_REPO:-}/lib/pihunt-common.sh"; do
+  [ -r "$__l" ] && { . "$__l"; break; }
+done; unset __l
+
+command -v python3 >/dev/null 2>&1 || exit 0
+
+# Resolve the scope config once, pass to python via env (newline-joined lists).
+PIHUNT_SCOPE_IN="$(pihunt_scope_list in_scope 2>/dev/null)"
+PIHUNT_SCOPE_OUT="$(pihunt_scope_list out_of_scope 2>/dev/null)"
+PIHUNT_SCOPE_RATE="$(pihunt_scope_get max_req_per_sec 2>/dev/null)"
+PIHUNT_SCOPE_MODE="${PIHUNT_SCOPE_GUARD_MODE:-ask}"
+# Read the hook event from stdin here (the python below takes its script on stdin
+# via the heredoc, so it cannot also read the event from stdin — pass it by env).
+PIHUNT_EVENT="$(cat)"
+export PIHUNT_SCOPE_IN PIHUNT_SCOPE_OUT PIHUNT_SCOPE_RATE PIHUNT_SCOPE_MODE PIHUNT_EVENT
+
+python3 -I <<'PY'
+import sys, os, json, re, fnmatch
+from urllib.parse import urlparse
+
+def emit_nothing():
+    # No output => defer to normal permission flow (other rules / prompts apply).
+    sys.exit(0)
+
+try:
+    event = json.loads(os.environ.get("PIHUNT_EVENT", ""))
+except Exception:
+    emit_nothing()
+
+in_scope  = [p.strip() for p in os.environ.get("PIHUNT_SCOPE_IN", "").splitlines() if p.strip()]
+out_scope = [p.strip() for p in os.environ.get("PIHUNT_SCOPE_OUT", "").splitlines() if p.strip()]
+rate      = os.environ.get("PIHUNT_SCOPE_RATE", "").strip()
+mode      = os.environ.get("PIHUNT_SCOPE_MODE", "ask").strip().lower()
+if mode not in ("ask", "deny"):
+    mode = "ask"
+
+# in_scope empty => guard disabled.
+if not in_scope and not out_scope:
+    emit_nothing()
+
+tool  = event.get("tool_name", "")
+tinp  = event.get("tool_input", {}) or {}
+
+PRIVATE_RE = re.compile(
+    r"^(localhost|127\.|0\.0\.0\.0|::1|10\.|192\.168\.|169\.254\.|"
+    r"172\.(1[6-9]|2[0-9]|3[01])\.)|(\.local)$|(^[^.]+$)", re.I)
+DOMAINISH  = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$", re.I)
+
+def host_of(token):
+    """Return a bare hostname from a URL or host[:port] token, else None."""
+    token = token.strip().strip('\'"`')
+    if not token:
+        return None
+    if "://" in token:
+        try:
+            net = urlparse(token).netloc
+        except Exception:
+            return None
+        net = net.split("@")[-1]          # strip user:pass@
+        net = net.split(":")[0]           # strip :port
+        return net.lower() or None
+    # bare host[:port]
+    cand = token.split("/")[0].split("@")[-1].split(":")[0].lower()
+    return cand or None
+
+def collect_hosts():
+    hosts = set()
+    if tool == "WebFetch":
+        h = host_of(str(tinp.get("url", "")))
+        if h:
+            hosts.add(h)
+        return hosts
+    if tool == "Bash":
+        cmd = str(tinp.get("command", ""))
+        # 1) every explicit URL
+        for m in re.findall(r"https?://[^\s'\"`|><)]+", cmd):
+            h = host_of(m)
+            if h:
+                hosts.add(h)
+        # 2) values after common target flags
+        for m in re.findall(r"(?:-u|--url|-d|--domain|--target|-H|--host)[=\s]+([^\s'\"`|><)]+)", cmd):
+            h = host_of(m)
+            if h and DOMAINISH.match(h):
+                hosts.add(h)
+        # 3) bare domain-like tokens (conservative: must look like a real FQDN)
+        for tok in re.split(r"[\s'\"`|><)(]+", cmd):
+            h = host_of(tok)
+            if h and DOMAINISH.match(h):
+                hosts.add(h)
+    return hosts
+
+def matches(host, patterns):
+    for p in patterns:
+        p = p.lower()
+        if fnmatch.fnmatch(host, p):
+            return True
+        if p.startswith("*.") and host == p[2:]:   # apex covered by *.domain
+            return True
+    return False
+
+hosts = {h for h in collect_hosts() if h and not PRIVATE_RE.search(h)}
+if not hosts:
+    emit_nothing()
+
+denied = sorted(h for h in hosts if matches(h, out_scope))
+unknown = sorted(
+    h for h in hosts
+    if not matches(h, out_scope) and in_scope and not matches(h, in_scope)
+)
+
+def respond(decision, reason):
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": decision,
+        "permissionDecisionReason": reason,
+    }}))
+    sys.exit(0)
+
+rate_note = f" (engagement floor: {rate} req/s)" if rate else ""
+
+if denied:
+    respond("deny", f"ROE scope guard: host(s) {', '.join(denied)} are "
+                    f"explicitly OUT OF SCOPE for this engagement. Request blocked.{rate_note}")
+if unknown:
+    respond(mode, f"ROE scope guard: host(s) {', '.join(unknown)} are not in the "
+                  f"engagement's in_scope list. Confirm this target is authorized "
+                  f"before proceeding.{rate_note}")
+
+emit_nothing()
+PY

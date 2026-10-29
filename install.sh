@@ -141,8 +141,8 @@ else warn "rag/install-rag.sh not bundled — skipping RAG"; fi
 
 c "6/7  launchers  ->  $H/.local/bin"
 run "mkdir -p '$H/.local/bin'"
-for l in pi-hunt pi-tier pihunt-config pihunt-gadgets pihunt-authz pihunt-triage pihunt-missions pihunt-profile pihunt-watchdog hunt-session hunt-brief submission-shots; do [ -f "$SRC/bin/$l" ] || continue; bk "$H/.local/bin/$l"; run "cp -p '$SRC/bin/$l' '$H/.local/bin/$l'"; rehome "$H/.local/bin/$l"; run "chmod +x '$H/.local/bin/$l'"; done
-ok "launchers: pi-hunt, pi-tier (cost tiering), hunt-session + hunt-brief (session routine), gadgets/authz/triage, missions/profile/watchdog (observability)"
+for l in pi-hunt pi-tier pihunt-config pihunt-gadgets pihunt-authz pihunt-triage pihunt-missions pihunt-profile pihunt-watchdog hunt-session hunt-brief submission-shots pihunt-scope-guard; do [ -f "$SRC/bin/$l" ] || continue; bk "$H/.local/bin/$l"; run "cp -p '$SRC/bin/$l' '$H/.local/bin/$l'"; rehome "$H/.local/bin/$l"; run "chmod +x '$H/.local/bin/$l'"; done
+ok "launchers: pi-hunt, pi-tier (cost tiering), hunt-session + hunt-brief (session routine), gadgets/authz/triage, missions/profile/watchdog (observability), pihunt-scope-guard (Claude Code ROE PreToolUse guard)"
 # shared bash lib the tools source (repo-root discovery, engagement/program resolution, TOML reads)
 if [ -d "$SRC/lib" ]; then
   run "mkdir -p '$H/.local/lib'"
