@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# pihunt-watchdog — subagent-level deadlock detector + (gated) remediation sidecar for pi-hunt.
+#
+# Companion to `pi-tier stall-watch`: stall-watch detects a GLOBAL stall; this resolves it to a
+# specific wedged SUBAGENT and — only once phase 0 proves it's safe — kills just that leaf so the
+# coordinator can recover, instead of relaunching the whole hunt and losing all in-flight context.
+#
+# Phased rollout (see docs/operator): 0 experiment (prove the coordinator actually recovers from a
+# subagent death on THIS pi build) -> 1 scan (read-only victim selection) -> 2 targeted kill ->
+# 3 escalation + reconcile. Phases 2-3 stay DISABLED here until phase 0 passes.
+#
+# Subcommands:
+#   pihunt-watchdog scan                 read-only: subagents + liveness + the would-be victim
+#   pihunt-watchdog experiment [--yes]   PHASE 0: kill one leaf subagent, watch if the coordinator resumes
+#   pihunt-watchdog watch [sec]          PHASE 1: loop scan, log wedged subagents (never kills)
+#   pihunt-watchdog status
+#
+# Env: PIHUNT_SUBAGENT_IDLE (180s own-transcript staleness that marks a subagent wedged),
+#      PIHUNT_WD_RECOVER_WAIT (45s to watch for coordinator recovery after a kill),
+#      PIHUNT_WD_CPU_WIN (2s CPU sample), PIHUNT_STALL_LEDGER (shared ledger), PIHUNT_CASEFILE.
+set -uo pipefail
+
+AGENT_DIR="$HOME/.pi/agent"
+SESS_DIR="$AGENT_DIR/sessions"
+LEDGER="${PIHUNT_STALL_LEDGER:-$AGENT_DIR/stall-ledger.jsonl}"
+CASEFILE="${PIHUNT_CASEFILE:-$PWD/.pi/casefile.jsonl}"
+IDLE="${PIHUNT_SUBAGENT_IDLE:-180}"
+RECOVER_WAIT="${PIHUNT_WD_RECOVER_WAIT:-45}"
+CPU_WIN="${PIHUNT_WD_CPU_WIN:-2}"
+
+ok(){ printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
+bad(){ printf '  \033[1;31m✗\033[0m %s\n' "$*"; }
+note(){ printf '%s\n' "$*"; }
+die(){ printf 'error: %s\n' "$*" >&2; exit 1; }
+
+wd_pids(){ pgrep -x pi 2>/dev/null; }
+wd_cpu_ns(){ awk '{print $1+0}' "/proc/$1/schedstat" 2>/dev/null || echo 0; }
+wd_wchan(){ cat "/proc/$1/wchan" 2>/dev/null || echo "?"; }
+wd_now(){ date +%s; }
+
+# pid is a subagent if its parent is also a pi; the one whose parent is NOT a pi is the coordinator/root
+wd_pidset(){ printf ' %s ' "$(wd_pids | tr '\n' ' ')"; }
+wd_is_subagent(){ local pp; pp=$(ps -o ppid= -p "$1" 2>/dev/null | tr -d ' '); case "$(wd_pidset)" in *" $pp "*) return 0 ;; *) return 1 ;; esac; }
+wd_root(){ local p pp set; set="$(wd_pidset)"; for p in $(wd_pids); do pp=$(ps -o ppid= -p "$p" 2>/dev/null|tr -d ' '); case "$set" in *" $pp "*) : ;; *) echo "$p"; return ;; esac; done; wd_pids | head -1; }
+wd_has_pi_child(){ local c set; set="$(wd_pidset)"; for c in $(ps -o pid= --ppid "$1" 2>/dev/null); do case "$set" in *" $c "*) return 0 ;; esac; done; return 1; }  # true if a pi child exists (not a leaf)
+
+# best-effort: the session transcript a pid has open (CONFIRM on first live run — fd heuristic)
+wd_session_file(){ ls -l "/proc/$1/fd" 2>/dev/null | grep -oE "/[^ ]*sessions/[^ ]*\.jsonl" | head -1; }
+wd_file_age(){ local m; [ -f "$1" ] || { echo -1; return; }; m=$(date -r "$1" +%s 2>/dev/null||echo 0); echo $(( $(wd_now) - m )); }
+wd_newest_global(){ local n=0 m; m=$(find "$SESS_DIR" -name '*.jsonl' -printf '%T@\n' 2>/dev/null|sort -nr|head -1|cut -d. -f1); [ -n "$m" ]&&n=$m; m=$(date -r "$CASEFILE" +%s 2>/dev/null||echo 0); [ "${m:-0}" -gt "$n" ]&&n=$m; echo "$n"; }
+wd_global_age(){ local n; n=$(wd_newest_global); [ "$n" -gt 0 ] && echo $(( $(wd_now) - n )) || echo -1; }
+
+wd_busy(){ local a b; a=$(wd_cpu_ns "$1"); sleep "$CPU_WIN"; b=$(wd_cpu_ns "$1"); [ $(( b - a )) -gt 50000000 ]; }   # >50ms CPU/window = working
+wd_pending_io(){ ss -tn 2>/dev/null state established "( sport = :* )" | awk 'NR>1 && ($1>0||$2>0){f=1} END{exit f?0:1}'; }  # any ESTAB with queued bytes (host-wide approx)
+
+# emit one machine line per subagent: pid|own_write_age|cpuio|wchan|verdict
+wd_assess(){
+  local root p sess sage wc cpuio verdict gage
+  root=$(wd_root); gage=$(wd_global_age)
+  for p in $(wd_pids); do
+    [ "$p" = "$root" ] && continue
+    wd_is_subagent "$p" || continue
+    sess=$(wd_session_file "$p"); sage=$(wd_file_age "$sess"); wc=$(wd_wchan "$p")
+    if wd_busy "$p"; then cpuio="BUSY"; else cpuio="IDLE"; fi
+    verdict="ok"
+    # WEDGED = idle CPU, its own transcript stale past IDLE, global progress also stalled, and it is a leaf
+    if [ "$cpuio" = "IDLE" ] && [ "$sage" -ge "$IDLE" ] && [ "$gage" -ge "$IDLE" ] && ! wd_has_pi_child "$p"; then verdict="WEDGED"; fi
+    printf '%s|%s|%s|%s|%s\n' "$p" "$sage" "$cpuio" "$wc" "$verdict"
+  done
+}
+
+wd_pick_victim(){ wd_assess | awk -F'|' '$5=="WEDGED"{print $1}' | tail -1; }  # leaf, most-recently-listed wedged
+
+wd_ledger(){ printf '{"ts":"%s","tool":"watchdog","event":"%s","pid":"%s","detail":"%s"}\n' "$(date -Is 2>/dev/null)" "$1" "${2:-}" "${3:-}" >> "$LEDGER" 2>/dev/null || true; }
+
+wd_scan(){
+  if [ -z "$(wd_pids)" ]; then note "no pi running (hunt down or paused) — nothing to scan"; return 1; fi
+  local root gage line pid sage cpuio wc verdict vic
+  root=$(wd_root); gage=$(wd_global_age)
+  note "coordinator (root) : pid $root"
+  note "global last write  : ${gage}s ago   (wedged threshold: ${IDLE}s)"
+  note "subagents:"
+  while IFS='|' read -r pid sage cpuio wc verdict; do
+    [ -n "$pid" ] || continue
+    printf '  pid %-7s own-write:%5ss  cpu:%-4s  wchan:%-16s  -> %s\n' "$pid" "$sage" "$cpuio" "$wc" "$verdict"
+  done < <(wd_assess)
+  vic=$(wd_pick_victim)
+  note ""
+  if [ -n "$vic" ]; then note "WOULD KILL (leaf, wedged): pid $vic"; else note "no wedged leaf subagent — nothing to remediate"; fi
+}
+
+wd_experiment(){
+  local yes="${1:-}" vic root g0 g1 waited
+  [ -n "$(wd_pids)" ] || die "no pi running — PHASE 0 needs a LIVE hunt. Relaunch (or run a benign toy pi), then re-run."
+  note "== PHASE 0: does the coordinator recover when a subagent dies? =="
+  vic=$(wd_pick_victim)
+  if [ -z "$vic" ]; then
+    root=$(wd_root)
+    vic=$(for p in $(wd_pids); do [ "$p" = "$root" ] && continue; wd_is_subagent "$p" && ! wd_has_pi_child "$p" && echo "$p"; done | tail -1)
+    [ -n "$vic" ] || die "no leaf subagent available to test with (is the hunt actually running subagents?)"
+    note "no naturally-wedged subagent; will test recovery by killing a live leaf subagent instead: $vic"
+  else
+    note "wedged leaf subagent detected: $vic"
+  fi
+  if [ "$yes" != "--yes" ]; then
+    note "DRY-RUN: would SIGKILL subagent $vic, then watch the coordinator for ${RECOVER_WAIT}s."
+    note "Re-run:  pihunt-watchdog experiment --yes   to actually perform the kill + measure recovery."
+    return 0
+  fi
+  g0=$(wd_newest_global)
+  note "killing leaf subagent $vic (SIGTERM, then SIGKILL) ..."
+  kill -TERM "$vic" 2>/dev/null; sleep 3; kill -9 "$vic" 2>/dev/null
+  wd_ledger "phase0_kill" "$vic" "watching coordinator ${RECOVER_WAIT}s"
+  note "watching coordinator for a new write (up to ${RECOVER_WAIT}s) ..."
+  waited=0
+  while [ "$waited" -lt "$RECOVER_WAIT" ]; do
+    sleep 5; waited=$(( waited + 5 )); g1=$(wd_newest_global)
+    if [ "$g1" -gt "$g0" ]; then
+      ok "RECOVERED after ${waited}s — coordinator wrote again. Targeted-kill is VIABLE -> build phases 2-3."
+      wd_ledger "phase0_result" "$vic" "PASS recovered ${waited}s"; echo "PASS"; return 0
+    fi
+  done
+  bad "NO recovery after ${RECOVER_WAIT}s — coordinator did not resume. Targeted-kill is NOT sufficient on this pi build; the watchdog's only safe action is a gated FULL relaunch."
+  wd_ledger "phase0_result" "$vic" "FAIL no recovery ${RECOVER_WAIT}s"; echo "FAIL"; return 1
+}
+
+wd_watch(){  # phase 1: detect-and-log loop, never kills
+  local iv="${1:-120}"
+  note "pihunt-watchdog watch (every ${iv}s, idle>=${IDLE}s, DETECT-ONLY — no kills until phase 0 passes)"
+  while true; do
+    local vic; vic=$(wd_pick_victim)
+    if [ -n "$vic" ]; then
+      note "$(date '+%F %T') watchdog: WEDGED leaf subagent pid $vic (would remediate once enabled)"
+      wd_ledger "detect_wedged" "$vic" "detect-only"
+    fi
+    sleep "$iv"
+  done
+}
+
+wd_status(){
+  if [ -z "$(wd_pids)" ]; then note "pi            : not running"; else
+    note "pi            : running ($(wd_pids | tr '\n' ' '))"
+    note "coordinator   : $(wd_root)"
+  fi
+  note "wedge idle    : ${IDLE}s    recover-wait: ${RECOVER_WAIT}s    cpu-win: ${CPU_WIN}s"
+  note "phases        : 0=experiment(ready) 1=scan/watch(ready)  2=kill 3=escalate (DISABLED pending phase 0)"
+  note "ledger        : $LEDGER"
+}
+
+case "${1:-status}" in
+  scan)        wd_scan ;;
+  experiment)  wd_experiment "${2:-}" ;;
+  watch)       wd_watch "${2:-120}" ;;
+  status)      wd_status ;;
+  -h|--help|help) sed -n '2,/^set -uo pipefail/p' "$0" | sed '/^set -uo pipefail/d; s/^#\s\?//' ;;
+  *) die "usage: pihunt-watchdog {scan|experiment [--yes]|watch [sec]|status}" ;;
+esac

@@ -20,12 +20,19 @@ set -uo pipefail
 QUICK=0
 [ "${1:-}" = "--quick" ] && QUICK=1
 
+# Shared helpers (repo-root discovery, engagement/program resolution, TOML reads).
+for __l in "$(dirname "${BASH_SOURCE[0]}")/../lib/pihunt-common.sh" \
+           "$HOME/.local/lib/pihunt-common.sh" "${PIHUNT_REPO:-}/lib/pihunt-common.sh"; do
+  [ -r "$__l" ] && { . "$__l"; break; }
+done; unset __l
+
 # Resolve repo root by walking up to the dir containing reports/ (bare-on-PATH safe).
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
 d="$PWD"
 while [ "$d" != "/" ]; do [ -d "$d/reports" ] && { REPO="$d"; break; }; d="$(dirname "$d")"; done
 export PATH="$HOME/.local/bin:$REPO/bin:$PATH"
-PROG="${PIHUNT_PROGRAM:-digitalocean}"
+PROG="$(command -v pihunt_program >/dev/null 2>&1 && pihunt_program)"
+[ -n "$PROG" ] || PROG="${PIHUNT_PROGRAM:-example-program}"
 RECON="$REPO/reports/$PROG/structured-recon"
 BRIEF="$REPO/reports/$PROG/SESSION-BRIEF.md"
 TUNE="$HOME/.pi/secrets/pihunt-tuning.env"

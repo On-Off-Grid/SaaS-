@@ -31,7 +31,13 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PATH="$HOME/.local/bin:$REPO/bin:$PATH"
-PROG="${PIHUNT_PROGRAM:-digitalocean}"
+# Shared helpers (repo-root discovery, engagement/program resolution, TOML reads).
+for __l in "$(dirname "${BASH_SOURCE[0]}")/../lib/pihunt-common.sh" \
+           "$HOME/.local/lib/pihunt-common.sh" "${PIHUNT_REPO:-}/lib/pihunt-common.sh"; do
+  [ -r "$__l" ] && { . "$__l"; break; }
+done; unset __l
+PROG="$(command -v pihunt_program >/dev/null 2>&1 && pihunt_program)"
+[ -n "$PROG" ] || PROG="${PIHUNT_PROGRAM:-example-program}"
 export PIHUNT_CASEFILE="$REPO/.pi/casefile.jsonl"
 PIDDIR="$HOME/.pi/agent"
 WATCHERS=(hybrid amdfb groqfb coordh concwatch stallwatch)   # pidfile basenames
@@ -90,8 +96,11 @@ cmd_up(){
 cmd_watchers(){
   c_hdr "start failover + safety watchers"
   clear_stale_pidfiles
-  pi-tier hybrid watch 300 &        # elite pair Kimi<->AMD on Kimi's 5h window
-  pi-tier amd-fallback watch 300 &  # AMD $1/day cap -> OpenRouter, back on reset
+  # DISABLED 2026-10-28: Kimi dropped from the harness (monthly quota); the hybrid watcher only
+  # managed the elite pair's Kimi<->fallback 5h window, which no longer applies. Elite pair is pinned
+  # to OpenRouter via ELITE_DEFAULT + the agent .md. Do NOT re-arm without reintroducing Kimi.
+  # pi-tier hybrid watch 300 &        # elite pair Kimi<->AMD on Kimi's 5h window
+  pi-tier amd-fallback watch 300 &  # AMD $1/day cap -> OpenRouter; debounced (cooldown) so it can't 5-min flap
   pi-tier groq-fallback watch 300 & # Groq free-tier (Qwen) 429/down -> OpenRouter, back on recovery
   pi-tier coord-health watch 120 &  # coordinator provider down -> stage healthy fallback
   pi-tier concurrency watch 300 &   # keep concurrency sized as providers flap

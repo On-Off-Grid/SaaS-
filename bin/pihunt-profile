@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# pihunt-profile — sample the running pi-hunt and log per-subagent timing + mission type to JSONL,
+# until the hunt ENDS (no pi) or HALTS (global no-progress > HALT). For post-hoc pattern debugging:
+# correlates "a stall alert would fire" against "subagents are actually working", and records how
+# long each mission type runs (spawn->exit lifetime) and how often it goes response-idle.
+#
+#   pihunt-profile            run the sampling loop (foreground; launch in background for a live hunt)
+# Env: PIHUNT_PROFILE_LOG (default ~/.pi/agent/hunt-profile.jsonl), PIHUNT_PROFILE_IV (20s),
+#      PIHUNT_PROFILE_HALT (900s global-idle that counts as halted), PIHUNT_STALL_THRESHOLD (600 alert line).
+set -u
+LOG="${PIHUNT_PROFILE_LOG:-$HOME/.pi/agent/hunt-profile.jsonl}"
+SESS_DIR="$HOME/.pi/agent/sessions"
+CASEFILE="${PIHUNT_CASEFILE:-$PWD/.pi/casefile.jsonl}"
+IV="${PIHUNT_PROFILE_IV:-20}"
+HALT="${PIHUNT_PROFILE_HALT:-900}"
+ALERT_AT="${PIHUNT_STALL_THRESHOLD:-600}"
+CPU_WIN=1
+MISSION_STATE="$HOME/.pi/agent/.profile-missions-state.json"              # dedup state for the transcript mission parser
+MISSIONS_BIN="$(command -v pihunt-missions 2>/dev/null || echo "$HOME/.local/bin/pihunt-missions")"
+AGENTS='recon|h1-scope-loader|intigriti-scope-loader|ssrf-hunter|oauth-hunter|llm-hunter|request-smuggling-hunter|cache-poison-hunter|rce-hunter|idor-logic-hunter|race-condition-hunter|path-traversal-hunter|injection-hunter|sqli-hunter|xss-hunter|bypass-innovator|security-analyzer|hypothesis-redteam|payload-researcher|wordlist-curator|cve-misconfig-hunter|strict-triager|test-account-manager|visual-security|deep-research'
+RUN="run_$(date +%Y%m%d-%H%M%S)"
+MAP="$(mktemp)"            # one line per live subagent: "pid mission spawn_epoch"
+trap 'rm -f "$MAP" "$MAP.snap" "$MAP.t"' EXIT
+
+ts(){ date -Is 2>/dev/null; }
+now(){ date +%s; }
+jlog(){ printf '%s\n' "$1" >> "$LOG"; }
+pids(){ pgrep -x pi 2>/dev/null; }
+cpu_ns(){ awk '{print $1+0}' "/proc/$1/schedstat" 2>/dev/null || echo 0; }
+in_set(){ case " $2 " in *" $1 "*) return 0;; *) return 1;; esac; }
+sess_of(){ ls -l "/proc/$1/fd" 2>/dev/null | grep -oE "/[^ ]*sessions/[^ ]*\.jsonl" | head -1; }
+age_of(){ [ -f "$1" ] && echo $(( $(now) - $(date -r "$1" +%s 2>/dev/null||echo 0) )) || echo -1; }
+newest_global(){ local n=0 m; m=$(find "$SESS_DIR" -name '*.jsonl' -printf '%T@\n' 2>/dev/null|sort -nr|head -1|cut -d. -f1); [ -n "$m" ]&&n=$m; m=$(date -r "$CASEFILE" +%s 2>/dev/null||echo 0); [ "${m:-0}" -gt "$n" ]&&n=$m; echo "$n"; }
+# best-effort mission = the agent name that appears most in the subagent's own transcript (its system prompt repeats its role)
+mission_of(){ [ -f "$1" ] || { echo unknown; return; }; grep -aoE "$AGENTS" "$1" 2>/dev/null | sort | uniq -c | sort -rn | head -1 | awk '{print $2}' | grep . || echo unknown; }
+
+jlog "{\"ts\":\"$(ts)\",\"ev\":\"run_start\",\"run\":\"$RUN\",\"iv\":$IV,\"halt_at\":$HALT,\"alert_at\":$ALERT_AT}"
+rm -f "$MISSION_STATE"   # fresh mission dedup per run
+seen=0; armed_at=$(now); hunt_start=$(now); WAIT_START="${PIHUNT_PROFILE_WAIT:-1800}"   # wait up to this long for the hunt to launch
+while true; do
+  cur="$(pids | tr '\n' ' ')"
+  if [ -z "${cur// /}" ]; then
+    if [ "$seen" = 1 ]; then jlog "{\"ts\":\"$(ts)\",\"ev\":\"hunt_end\",\"run\":\"$RUN\"}"; break; fi
+    [ $(( $(now) - armed_at )) -ge "$WAIT_START" ] && { jlog "{\"ts\":\"$(ts)\",\"ev\":\"never_started\",\"run\":\"$RUN\"}"; break; }
+    sleep "$IV"; continue
+  fi
+  [ "$seen" = 0 ] && hunt_start=$(now); seen=1   # baseline idle from when THIS hunt launched, not stale prior-run files
+  gstamp=$(newest_global); [ "${gstamp:-0}" -lt "$hunt_start" ] && gstamp=$hunt_start; gage=$(( $(now) - ${gstamp:-$(now)} ))
+  coord=""; for p in $cur; do pp=$(ps -o ppid= -p "$p" 2>/dev/null|tr -d ' '); in_set "$pp" "$cur" || coord="$p"; done
+  # REAL subagent missions + response times: subagents run IN-PROCESS (piolium agent-runner), so they
+  # have no own process/transcript — parse the coordinator's session jsonl for subagent toolCall/result.
+  active="$(find "$SESS_DIR" -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+  [ -n "$active" ] && "$MISSIONS_BIN" "$active" "$MISSION_STATE" "$LOG" "$RUN" 2>/dev/null || true
+  # lightweight per-pi liveness so a wedge is visible (these are OS pi procs, NOT logical subagents)
+  npi=0; busy=0
+  for p in $cur; do
+    npi=$((npi+1))
+    a=$(cpu_ns "$p"); sleep "$CPU_WIN"; b=$(cpu_ns "$p"); [ $((b-a)) -gt 50000000 ] && cpu=busy || cpu=idle
+    [ "$cpu" = busy ] && busy=$((busy+1))
+    role=worker; [ "$p" = "$coord" ] && role=coord
+    jlog "{\"ts\":\"$(ts)\",\"ev\":\"proc\",\"run\":\"$RUN\",\"pid\":$p,\"role\":\"$role\",\"cpu\":\"$cpu\",\"wchan\":\"$(cat /proc/$p/wchan 2>/dev/null||echo '?')\"}"
+  done
+  [ "$gage" -ge "$ALERT_AT" ] && alert=fire || alert=ok
+  jlog "{\"ts\":\"$(ts)\",\"ev\":\"coord\",\"run\":\"$RUN\",\"coord_pid\":\"$coord\",\"global_idle_s\":$gage,\"n_pi\":$npi,\"busy_pi\":$busy,\"alert\":\"$alert\"}"
+  if [ "$gage" -ge "$HALT" ]; then jlog "{\"ts\":\"$(ts)\",\"ev\":\"halt\",\"run\":\"$RUN\",\"global_idle_s\":$gage}"; break; fi
+  sleep "$IV"
+done

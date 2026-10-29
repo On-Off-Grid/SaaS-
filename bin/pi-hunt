@@ -59,7 +59,13 @@ done
 
 # Canonical recon front door. Every agent/CLI/RAG reader uses reports/<program>/structured-recon;
 # the engine writes there instead of the legacy ~/hunts tree.
-PIHUNT_REPO="${PIHUNT_REPO:-__PIHUNT_HOME__/Desktop/Desktop/harness}"
+# Repo root: honor $PIHUNT_REPO, else discover it via the shared lib, else cwd.
+for __l in "$(dirname "${BASH_SOURCE[0]}")/../lib/pihunt-common.sh" \
+           "$HOME/.local/lib/pihunt-common.sh" "${PIHUNT_REPO:-}/lib/pihunt-common.sh"; do
+  [ -r "$__l" ] && { . "$__l"; break; }
+done; unset __l
+PIHUNT_REPO="${PIHUNT_REPO:-$(command -v pihunt_repo_root >/dev/null 2>&1 && pihunt_repo_root)}"
+PIHUNT_REPO="${PIHUNT_REPO:-$PWD}"
 export PIHUNT_RECON_ROOT="${PIHUNT_RECON_ROOT:-$PIHUNT_REPO/reports}"
 
 # Coordinator model is state-driven so pi-tier can change it without editing

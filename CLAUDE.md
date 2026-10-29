@@ -1,15 +1,27 @@
 # CLAUDE.md
 
-This repo is the **bug-bounty hunt** (`SaaS-` remote), program **Intigriti `digitalocean`**,
-researcher `onoffgrid`, floor HIGH–CRITICAL. The SaaS idea lives in the `kimi_harness` fork —
-keep context here on hunting. Launch Claude Code **from this folder** so cwd + claude-mem keys align.
+This repo is a **bug-bounty hunting harness** (pi-hunt). The engagement it targets — program,
+platform, researcher, severity floor — is **not hardcoded here**: it lives in declarative config
+(`config/engagement.toml`, overridden by the git-ignored `config/engagement.local.toml`, and by
+`$PIHUNT_PROGRAM` per-shell), and the tools resolve it via `lib/pihunt-common.sh`. Run `hunt-brief`
+to see the active engagement. Launch Claude Code **from this folder** so cwd + claude-mem keys align.
+
+## Configure (the `config/` layer is the single source of truth)
+Declarative TOML under `config/`:
+- `config/engagement.toml` — program / platform / researcher / floor (copy to `engagement.local.toml`).
+- `config/providers.toml` · `config/tiers.toml` · `config/machines.toml` — LLM providers, per-agent
+  model tiers, and named laptop/desktop profiles (selected by `$PIHUNT_MACHINE`). Compiled by
+  `bin/pihunt-config` into `models.json` + pi-tier's tier defaults.
+- `config/secrets/*.env.example` — copy each to `~/.pi/secrets/<name>.env` and fill in the key(s).
+
+See `config/README.md` for the full reference (and `docs/SANDBOX.md` if this is the refactor clone).
 
 ## Rapid context (read in this order)
-1. **`reports/digitalocean/SESSION-BRIEF.md`** — auto-generated every session by the `hunt-brief`
+1. **`reports/<program>/SESSION-BRIEF.md`** (`<program>` = your engagement slug) — auto-generated every session by the `hunt-brief`
    SessionStart hook (also printed into your first turn): last state, the graph+registry **suggested
    next action**, the exact endpoint, live-ish quota, and the commands to act. Read-only; regenerated.
    Run `hunt-brief` (or `hunt-session brief`) anytime to refresh it.
-2. **`reports/digitalocean/SESSION-HANDOFF-20261028.md`** — the **curated** "where to steer" narrative
+2. **`reports/<program>/SESSION-HANDOFF-<date>.md`** — the **curated** "where to steer" narrative
    (campaign state, ROE, provider notes). Hand-authored; the brief complements it, never overwrites it.
 3. **`docs/operator/OPERATOR-GUIDE.md`** — the before/during/after routine. Reading the graph output:
    **`docs/operator/reading-the-steer-output.md`**.
@@ -35,4 +47,5 @@ lives only on disk, so these files are the source of truth for a fresh session.
 A probe result must land in **all three** files or the ranking lies (see "Graph hygiene" in
 reading-the-steer-output.md): the gadget node (`gadget-graph.jsonl`, fill `grants` on a negative),
 its chain's status, and `authz-differential.jsonl`. Then the brief/rank/gaps self-correct.
-Edit a `bin/*` tool → redeploy with `cp -p bin/<tool> ~/.local/bin/`.
+Edit a `bin/*` tool → redeploy with `cp -p bin/<tool> ~/.local/bin/` (and `lib/*.sh` → `~/.local/lib/`
+if you touched the shared lib). Simplest: rerun `install.sh` to redeploy tools + lib together.
