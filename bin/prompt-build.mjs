@@ -11,7 +11,12 @@
  *   node bin/prompt-build.mjs                build + deploy (backup .bak-<ts>) + sync repo mirror
  *   node bin/prompt-build.mjs --dry          build to stdout, write nothing
  *   node bin/prompt-build.mjs --check        FAIL if deployed files drift from a fresh build
+ *   node bin/prompt-build.mjs --repo-only    write/compare ONLY the repo mirror, never the live
+ *                                            deploy (sandbox/CI safe; combine with --check)
  *   node bin/prompt-build.mjs --manifest     write token manifest (uses tsize.mjs)
+ *
+ * Each agent's `model:` is resolved from config/tiers.toml (the single source of truth,
+ * shared with pi-tier) by tier membership; the frontmatter `model:` is only a fallback.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -27,7 +32,27 @@ const MIRROR = path.join(REPO, "pi-agent", "agents");
 const args = process.argv.slice(2);
 const DRY = args.includes("--dry");
 const CHECK = args.includes("--check");
+const REPO_ONLY = args.includes("--repo-only");   // write only the repo mirror, never the live deploy (sandbox/CI safe)
 const ts = () => new Date().toISOString().replace(/[-:]/g, "").slice(0, 15).replace("T", "-");
+
+// Per-agent model is resolved from config/tiers.toml — the single source of truth shared
+// with pi-tier: elite if the agent is in agents.elite, fast if in agents.fast, else hunter.
+// Loaded via `pihunt-config tiers-json` (python owns the TOML parser). If the config is
+// unavailable, each agent falls back to its frontmatter `model:`.
+const TIERS = (() => {
+  try {
+    const out = execFileSync("python3", [path.join(REPO, "bin", "pihunt-config"), "tiers-json"], { encoding: "utf8" });
+    return JSON.parse(out);
+  } catch { return null; }
+})();
+
+function resolveModel(name, fallback) {
+  if (!TIERS || !TIERS.tiers) return fallback;
+  const a = TIERS.agents || {};
+  const inList = (k) => Array.isArray(a[k]) && a[k].includes(name);
+  const tier = inList("elite") ? "elite" : inList("fast") ? "fast" : "hunter";
+  return TIERS.tiers[tier] || fallback;
+}
 
 /** Parse prompts/<class>/<agent>.md: frontmatter + delta body. */
 function readSource(file) {
@@ -65,7 +90,7 @@ function assemble(src) {
     "---",
     `name: ${fm.name}`,
     `description: ${JSON.stringify(fm.description)}`,
-    `model: ${fm.model}`,
+    `model: ${resolveModel(fm.name, fm.model)}`,
     ...(fm.tools ? [`tools: ${fm.tools}`] : []),
     ...(fm.skills ? [`skills: ${fm.skills}`] : []),
     "---",
@@ -108,18 +133,25 @@ for (const s of sources) {
   const mirror = path.join(MIRROR, `${src.fm.name}.md`);
   const tok = tokenCount(built);
   totalTok += Math.max(tok, 0);
-  const cur = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : null;
+  const cur = (!REPO_ONLY && fs.existsSync(target)) ? fs.readFileSync(target, "utf8") : null;
   const mir = fs.existsSync(mirror) ? fs.readFileSync(mirror, "utf8") : null;
-  const same = cur === built && (mir === null || mir === built);
-  rows.push({ name: src.fm.name, cls: s.cls, tokens: tok, drift: !same && cur !== null });
+  const same = REPO_ONLY ? (mir !== null && mir === built) : (cur === built && (mir === null || mir === built));
+  rows.push({ name: src.fm.name, cls: s.cls, tokens: tok, drift: !same && (REPO_ONLY ? mir !== null : cur !== null) });
 
   if (CHECK) {
-    if (!same && cur !== null) { drift++; console.error(`DRIFT: ${src.fm.name}.md`); }
+    if (REPO_ONLY) {
+      if (mir === null || mir !== built) { drift++; console.error(`DRIFT (repo mirror): ${src.fm.name}.md`); }
+    } else if (!same && cur !== null) { drift++; console.error(`DRIFT: ${src.fm.name}.md`); }
     else if (mir !== null && mir !== built) { drift++; console.error(`DRIFT (repo mirror): ${src.fm.name}.md`); }
     continue;
   }
   if (DRY) {
     console.log(`=== ${src.fm.name}.md (${s.cls}, ~${tok} tok) ===\n${built}`);
+    continue;
+  }
+  if (REPO_ONLY) {
+    if (mir !== null && mir !== built) fs.copyFileSync(mirror, `${mirror}.bak-${ts()}`);
+    fs.writeFileSync(mirror, built);
     continue;
   }
   if (cur !== null && !same) {

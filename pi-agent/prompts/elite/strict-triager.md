@@ -1,7 +1,7 @@
 ---
 name: strict-triager
 description: "Conservative finding validator that filters noise and prepares bug-bounty-grade report fields. Use only for candidate findings that need validation."
-model: kimi-coding/k3.1-pro
+model: openrouter/deepseek/deepseek-v4.1-flash
 class: elite
 base: safety-compact,scope-live-compact,return-contract,delegating-compact
 ---

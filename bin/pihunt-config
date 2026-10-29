@@ -8,6 +8,7 @@ runtime reads, so the old three-copies-that-drift problem can't recur.
 Subcommands:
   validate                 check config coherence; exit non-zero on error
   show      [--machine M]   print the resolved config (providers, tiers, machine)
+  tiers-json               print {tiers, agents} as JSON (consumed by prompt-build)
   build     [--machine M]   regenerate the derived artifacts:
             [--dry]           * pi-agent/models.json   (managed providers; dormant preserved)
                               * build/tier-defaults.sh (pi-tier tier defaults + CONC_* overlay)
@@ -305,6 +306,9 @@ def main(argv):
         return cmd_show(cfg, machine)
     if cmd == "build":
         return cmd_build(cfg, machine, dry)
+    if cmd == "tiers-json":
+        print(json.dumps({"tiers": cfg["tiers"], "agents": cfg["agents"]}))
+        return 0
     err(f"unknown subcommand: {cmd}")
     print(__doc__)
     return 2

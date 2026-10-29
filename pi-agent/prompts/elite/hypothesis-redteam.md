@@ -1,7 +1,7 @@
 ---
 name: hypothesis-redteam
 description: "Adversarial hypothesis generator. Invents novel, non-obvious attack ideas and challenges 'looks safe' verdicts to surface EXCEPTIONAL bugs the class-bound specialists never propose."
-model: kimi-coding/k3.1-pro
+model: openrouter/deepseek/deepseek-v4.1-flash
 class: elite
 base: safety-compact,scope-live-compact,return-contract,delegating-compact,tool-discipline,stop-conditions
 ---
