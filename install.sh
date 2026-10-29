@@ -47,6 +47,12 @@ command -v java >/dev/null && ok "java present (burp MCP)" || warn "java NOT fou
 
 c "0/9  config: validate + compile (config/*.toml -> models.json + tier defaults)"
 if [ -f "$SRC/bin/pihunt-config" ]; then
+  # per-machine profile selection (git-ignored); seed active=default if this box has none
+  if [ ! -f "$SRC/config/machines.local.toml" ]; then
+    if [ "$DRY" = 1 ]; then printf '   [dry] seed config/machines.local.toml (active=default)\n'
+    else printf '%s\n' '# per-machine profile (git-ignored). Set active to a profile in machines.toml.' 'active = "default"' > "$SRC/config/machines.local.toml" && warn "seeded config/machines.local.toml (active=default) — set it to laptop/desktop for this box"; fi
+  fi
+  MACHINE="$(python3 "$SRC/bin/pihunt-config" active-machine 2>/dev/null || echo "$MACHINE")"
   python3 "$SRC/bin/pihunt-config" validate || { warn "config validate FAILED — fix config/*.toml and re-run"; [ "$DRY" = 0 ] && exit 1; }
   if [ "$DRY" = 1 ]; then python3 "$SRC/bin/pihunt-config" build --machine "$MACHINE" --dry >/dev/null && ok "[dry] would compile config (machine=$MACHINE)"
   else python3 "$SRC/bin/pihunt-config" build --machine "$MACHINE" >/dev/null && ok "compiled config (machine=$MACHINE) -> models.json + build/"; fi

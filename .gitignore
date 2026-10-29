@@ -40,6 +40,7 @@ gcp-oauth.keys.json
 # Config layer — commit the templates (config/*.toml, config/secrets/*.env.example);
 # never the filled-in local files.
 config/engagement.local.toml
+config/machines.local.toml
 config/secrets/*.env
 !config/secrets/*.env.example
 

@@ -15,7 +15,8 @@ of files here, runs the installer, and hunts — without touching tool code.
 | `engagement.local.toml` | **no** (git-ignored) | Your real engagement. Overrides `engagement.toml`. This is what keeps a machine pointed at its actual program. |
 | `providers.toml` | yes | LLM provider definitions: `base_url`, `api`, key env-var, `models[]`, cost, probe metadata. `pihunt-config build` regenerates `models.json` from the `managed` blocks (dormant preserved). |
 | `tiers.toml` | yes | Tier → model map (fast/hunter/flagship/elite/coordinator) + which agent is in which tier. Compiled into pi-tier's tier defaults. |
-| `machines.toml` | yes | Named machine profiles (`[laptop]` / `[desktop]` / `[default]`): cores, RAM, concurrency ceiling. Selected by `$PIHUNT_MACHINE`. |
+| `machines.toml` | yes | **Generic** machine profiles (`[laptop]` / `[desktop]` / `[default]`): cores, RAM, concurrency ceiling. Shareable; no box-specific data. |
+| `machines.local.toml` | **no** (git-ignored) | This box's `active = "<profile>"` selection plus any profile overrides with real local hardware. Overrides `machines.toml`. |
 | `secrets/*.env.example` | yes (templates) | One per provider/integration. Copy each to `~/.pi/secrets/<name>.env` and fill in the key. |
 
 ## How resolution works
@@ -27,6 +28,10 @@ of files here, runs the installer, and hunts — without touching tool code.
 - **Secrets:** never committed. `install.sh` seeds any missing `~/.pi/secrets/<name>.env`
   from the matching `.env.example` here, then warns you to fill them in. `pi` and the tools
   read the keys from the environment (the shell rc sources `~/.pi/secrets/*.env`).
+- **Machine profile:** `--machine` → `$PIHUNT_MACHINE` → `machines.local.toml` `active` →
+  `[default]`. Set it per box in `machines.local.toml` (git-ignored) so it is never pushed;
+  `pihunt-config active-machine` prints what resolves, and `install.sh` seeds the file
+  (`active = "default"`) if the box has none yet.
 
 ## Set your engagement
 

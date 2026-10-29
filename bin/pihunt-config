@@ -9,6 +9,8 @@ Subcommands:
   validate                 check config coherence; exit non-zero on error
   show      [--machine M]   print the resolved config (providers, tiers, machine)
   tiers-json               print {tiers, agents} as JSON (consumed by prompt-build)
+  active-machine           print the resolved machine profile name (--machine >
+                           $PIHUNT_MACHINE > machines.local.toml `active` > default)
   build     [--machine M]   regenerate the derived artifacts:
             [--dry]           * pi-agent/models.json   (managed providers; dormant preserved)
                               * build/tier-defaults.sh (pi-tier tier defaults + CONC_* overlay)
@@ -79,6 +81,15 @@ def read_all():
     providers, _ = load("providers.toml")
     tiers, _ = load("tiers.toml")
     machines, _ = load("machines.toml")
+    # machines.local.toml (git-ignored, per-machine): a top-level `active = "<name>"`
+    # names this box's profile, and any profile tables override/extend the committed ones.
+    mlocal, _ = load("machines.local.toml")
+    active = mlocal.pop("active", None) if isinstance(mlocal, dict) else None
+    for name, prof in (mlocal or {}).items():
+        if isinstance(prof, dict):
+            merged = dict(machines.get(name, {}))
+            merged.update(prof)
+            machines[name] = merged
     engagement = {}
     for n in ("engagement.local.toml", "engagement.toml"):
         d, _ = load(n)
@@ -90,6 +101,7 @@ def read_all():
         "tiers": tiers.get("tiers", {}),
         "agents": tiers.get("agents", {}),
         "machines": machines,
+        "machine_active": active,
         "engagement": engagement.get("engagement", {}),
     }
 
@@ -145,6 +157,11 @@ def cmd_validate(cfg):
         for req in ("max_concurrency", "conc_high", "conc_mid", "conc_base"):
             if req not in m:
                 err(f"machine '{mname}': missing '{req}'"); errors += 1
+
+    # the per-machine active selection (machines.local.toml) must name a real profile
+    active = cfg.get("machine_active")
+    if active and active not in machines:
+        err(f"machines.local.toml active='{active}' is not a defined machine profile"); errors += 1
 
     # agent tier lists are strings
     for grp in ("elite", "fast"):
@@ -313,13 +330,18 @@ def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__); return 0
     cmd = argv[0]
-    machine = os.environ.get("PIHUNT_MACHINE", "default")
     dry = "--dry" in argv
+    cfg = read_all()
+    # machine resolution: --machine > $PIHUNT_MACHINE > machines.local active > "default"
+    machine = None
     if "--machine" in argv:
         i = argv.index("--machine")
         if i + 1 < len(argv):
             machine = argv[i + 1]
-    cfg = read_all()
+    machine = machine or os.environ.get("PIHUNT_MACHINE") or cfg.get("machine_active") or "default"
+    if cmd == "active-machine":
+        print(machine)
+        return 0
     if cmd == "validate":
         return cmd_validate(cfg)
     if cmd == "show":

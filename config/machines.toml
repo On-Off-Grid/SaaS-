@@ -1,9 +1,15 @@
 # config/machines.toml — named machine profiles for local-agent concurrency.
 #
-# Select a profile with $PIHUNT_MACHINE (e.g. `export PIHUNT_MACHINE=laptop`).
-# If unset, the [default] profile is used. pi-tier still scales concurrency to how
-# many LLM providers are usable right now, but never above this profile's ceiling,
-# and the conc_high/mid/base values below replace pi-tier's old hardcoded 6/4/3.
+# These are GENERIC, shareable profiles. The profile THIS box uses — and any
+# box-specific numbers — belong in config/machines.local.toml (git-ignored):
+#     active = "desktop"
+#     [desktop]            # override only the keys that differ on this machine
+#     cores = 12
+#     ram_gb = 15
+# Resolution: --machine > $PIHUNT_MACHINE > machines.local.toml `active` > [default].
+# pi-tier still scales concurrency to how many LLM providers are usable right now,
+# but never above the resolved profile's ceiling, and the conc_high/mid/base values
+# replace pi-tier's old hardcoded 6/4/3.
 #
 # `pihunt-config build --machine <name>` writes these into ~/.pi/agent/.tier-defaults.sh
 # (CONC_HIGH/MID/BASE) and seeds ~/.pi/secrets/pihunt-tuning.env (queue, RAM floor).
@@ -25,9 +31,9 @@ conc_high = 3
 conc_mid = 2
 conc_base = 1
 
-[desktop]            # the current box: 12 cores / 15 GB (~8 GB free)
+[desktop]            # a typical workstation (put exact specs in machines.local.toml)
 cores = 12
-ram_gb = 15
+ram_gb = 16
 max_concurrency = 6
 max_queue = 12
 ram_floor_mb = 1500
