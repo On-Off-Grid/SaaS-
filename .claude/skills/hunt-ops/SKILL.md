@@ -9,9 +9,7 @@ argument-hint: "[program]"
 allowed-tools: >-
   Bash(hunt-brief), Bash(hunt-brief *), Bash(hunt-session *), Bash(pihunt-gadgets *),
   Bash(pihunt-authz *), Bash(pihunt-triage *), Read, Edit,
-  mcp__pihunt-rag__*, mcp__burp__*, Skill(writeup)
-paths:
-  - "reports/**"
+  mcp__pihunt-rag__*, mcp__burp__*
 ---
 
 # hunt-ops — operator cockpit
@@ -20,20 +18,19 @@ You are driving an **authorized, ROE-bound** bug-bounty engagement from Claude C
 The live hunters run in the separate `pi` runtime; your job here is to orient,
 steer, keep state honest, and close findings out — not to re-run the hunters.
 
-## Live state (injected at invoke time)
+## Step 0 — load live state
 
-Active brief:
-!`bin/hunt-brief --quick 2>/dev/null || echo "(hunt-brief unavailable)"`
+Run these first (read-only) and read the output before doing anything else:
 
-Single best next action:
-!`bin/pihunt-gadgets suggest 2>/dev/null || echo "(pihunt-gadgets unavailable)"`
-
-Authz gaps to test next:
-!`bin/pihunt-authz gaps 2>/dev/null || echo "(pihunt-authz unavailable)"`
+```bash
+bin/hunt-brief --quick        # session brief: last state + suggested next action
+bin/pihunt-gadgets suggest    # single best next action (graph + chaining registry)
+bin/pihunt-authz gaps         # forgotten-sibling-verb cells to test next
+```
 
 ## The loop
 
-1. **Orient.** Read the brief + suggestion above. If a `[program]` argument was
+1. **Orient.** Read the brief + suggestion from Step 0. If a `[program]` argument was
    given ($ARGUMENTS), confirm it matches the resolved engagement; otherwise use the
    resolved one. For deeper context, query `mcp__pihunt-rag__*` for prior work on
    this program, techniques for the vuln class, and current recon.
