@@ -71,6 +71,12 @@ conf=sum(1 for x in g if x.get("status")=="confirmed"); neg=sum(1 for x in g if 
 print(f"- graph: {len(c)} chains, {len(g)} gadgets ({conf} confirmed, {neg} negative/killed)")
 PY
   fi
+  # Program updates: read-only, offline (reads on-disk snapshots only; no network,
+  # no mutation — the fetch that refreshes them is the deliberate `pihunt-updates
+  # fetch` step). Keeps the brief's zero-mutation / --quick contract intact.
+  if have pihunt-updates; then
+    pihunt-updates show --program "$PROG" --limit 3 2>/dev/null | sed '1d;s/^/- updates: /' | head -6
+  fi
   echo
 
   echo "## Suggested next action (graph + chaining registry)"

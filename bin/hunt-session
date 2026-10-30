@@ -80,6 +80,22 @@ cmd_up(){
   clear_stale_pidfiles
   pi-tier on                 # mechanical->Mistral, hunters+coord->AMD DeepSeek, elite->Kimi
   pi-tier concurrency once    # size PI_SUBAGENT_MAX_CONCURRENCY from providers up RIGHT NOW
+  # Refresh the program-updates snapshot (scope/ROE/status fingerprint). `up` is the
+  # mutating path, so a network fetch belongs here, not in the read-only brief. A
+  # detected change is surfaced loudly; a missing token / API error is non-fatal.
+  c_hdr "program updates (Intigriti)"
+  if command -v pihunt-updates >/dev/null 2>&1; then
+    pihunt-updates fetch --program "$PROG"; local rc=$?
+    if [ "$rc" = 10 ]; then
+      echo
+      echo "  !! SCOPE/ROE/STATUS CHANGED since last snapshot — re-read before launching."
+      echo "     If assets moved, re-run the scope-loader and diff the scope."
+    elif [ "$rc" = 2 ]; then
+      echo "  (updates fetch skipped: no \$INTIGRITI_APP token or API error — non-fatal)"
+    fi
+  else
+    echo "  (pihunt-updates not installed — skipping the updates check)"
+  fi
   c_hdr "advised: start the failover + safety watchers"
   echo "  idempotent config is applied above. Watchers are background daemons, so"
   echo "  they are NOT auto-started — run them when you commit to the hunt:"
