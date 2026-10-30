@@ -44,6 +44,26 @@ PIHUNT_SCOPE_IN="$(pihunt_scope_list in_scope 2>/dev/null)"
 PIHUNT_SCOPE_OUT="$(pihunt_scope_list out_of_scope 2>/dev/null)"
 PIHUNT_SCOPE_RATE="$(pihunt_scope_get max_req_per_sec 2>/dev/null)"
 PIHUNT_SCOPE_MODE="${PIHUNT_SCOPE_GUARD_MODE:-ask}"
+
+# --- enforcement gate --------------------------------------------------------
+# The guard only challenges when a hunt is LIVE or the operator switched it on,
+# so ordinary operator/doc/dev work is never prompted. Resolution:
+#   PIHUNT_SCOPE_GUARD (env, set before launch) overrides [scope].enforce (config).
+#   Values: on|always | off|never | auto (default).
+#     auto  -> enforce only while a hunt is live (pgrep -x pi — the harness's
+#              canonical live-hunt signal, same one hunt-session reports).
+#     on    -> always enforce (manual operator switch).
+#     off   -> never enforce (passive), even mid-hunt.
+__mode="${PIHUNT_SCOPE_GUARD:-$(pihunt_scope_get enforce 2>/dev/null)}"
+__mode="$(printf '%s' "$__mode" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+case "$__mode" in
+  on|1|true|yes|always)  __enforce=1 ;;
+  off|0|false|no|never)  __enforce=0 ;;
+  *)  if command -v pgrep >/dev/null 2>&1 && pgrep -x pi >/dev/null 2>&1; then
+        __enforce=1; else __enforce=0; fi ;;   # auto / empty / unknown -> live-hunt only
+esac
+[ "$__enforce" = 1 ] || exit 0   # passive: emit nothing, allow all
+
 # Read the hook event from stdin here (the python below takes its script on stdin
 # via the heredoc, so it cannot also read the event from stdin — pass it by env).
 PIHUNT_EVENT="$(cat)"
