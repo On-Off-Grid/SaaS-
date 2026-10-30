@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""pihunt-updates — track an Intigriti program's updates/activities feed.
+
+The scope-loader agent reads a program's *current* scope + ROE. It cannot tell you
+that the program just CHANGED something — a new scope version, a new rules-of-
+engagement version, a status flip (Open/Suspended). That signal lives on the
+program's "updates" tab, backed by the researcher API's program-activities feed.
+Historically the only way the harness caught a change was a human re-running the
+loader and hand-diffing the JSON (the `scope-reload-<date>.md` notes). This tool
+makes that automatic.
+
+How it works (grounded in what the API actually exposes):
+  * `GET /programs/{guid}` returns authoritative *version ids* — `domains.id` and
+    `rulesOfEngagement.id` (GUIDs) plus `status` and each block's `createdAt`. Those
+    ids change exactly when the program publishes a new scope/ROE version. That
+    fingerprint is the primary, one-request, reliable signal.
+  * `GET /programs/activities` is the human-readable transition feed ("New domains
+    version added", fromVersionId->toVersionId, etc.) but it is GLOBAL across all
+    programs and tens of thousands deep, so one program's events can sit thousands
+    of records down. We scan it only as a bounded, opt-in best-effort (`--pages N`)
+    to attach human-readable context to a detected change.
+
+A `fetch` snapshots the fingerprint (+ any scanned activity records) to
+reports/<prog>/live-intel/updates-<utc>.json and prints what changed vs the prior
+snapshot. `show` reads only those on-disk snapshots (no network) and is what the
+session brief calls, so the brief stays zero-mutation and offline-safe.
+
+Auth: bearer token in $INTIGRITI_APP (the app token the scope-loader uses, NOT
+$INTIGRITI_TOKEN). If unset, ~/.pi/secrets/intigriti.env is parsed. Tokens are
+never printed or snapshotted.
+
+Usage:
+  pihunt-updates fetch [--program P] [--pages N]   refresh snapshot + print changes
+  pihunt-updates show  [--program P] [--new] [--limit N]   read-only, from disk
+  pihunt-updates --help
+
+Default program: config/engagement{.local}.toml -> engagement.program (or $PIHUNT_PROGRAM / --program).
+Exit codes (fetch): 0 no change, 10 change detected, 2 error (network/auth/config).
+"""
+import json
+import os
+import sys
+import time
+import datetime
+import urllib.request
+import urllib.error
+import urllib.parse
+
+API_BASE = "https://api.intigriti.com/external/researcher/v1"
+SECRETS_ENV = os.path.expanduser("~/.pi/secrets/intigriti.env")
+PAGE_SIZE = 200  # activities page size when scanning the global feed
+# When a fingerprint change is detected and the caller didn't force --pages, scan
+# this many top pages to correlate the change with its human-readable feed event.
+# A freshly published change is a RECENT activity (the feed is newest-first), so it
+# sits near the top exactly when we detect it — a small budget is enough.
+CORRELATE_PAGES = 3
+
+
+def _find_root():
+    d = os.getcwd()
+    while True:
+        if os.path.isdir(os.path.join(d, "reports")) or os.path.exists(os.path.join(d, ".pihunt-root")):
+            return d
+        p = os.path.dirname(d)
+        if p == d:
+            return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        d = p
+
+
+ROOT = _find_root()
+
+
+def _engagement_program():
+    import tomllib
+    for name in ("engagement.local.toml", "engagement.toml"):
+        p = os.path.join(ROOT, "config", name)
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p, "rb") as fh:
+                eng = tomllib.load(fh).get("engagement", {}) or {}
+        except Exception:
+            continue
+        if eng.get("program"):
+            return str(eng["program"])
+    return ""
+
+
+def _opt(argv, flag, default=None):
+    return argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else default
+
+
+def _resolve_program(argv):
+    return _opt(argv, "--program") or os.environ.get("PIHUNT_PROGRAM") or _engagement_program() or "example-program"
+
+
+def _token():
+    """Bearer app token: $INTIGRITI_APP, else parsed from the secrets env file.
+    Returns the token string or "" (never logged)."""
+    tok = os.environ.get("INTIGRITI_APP", "").strip()
+    if tok:
+        return tok
+    try:
+        with open(SECRETS_ENV) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                if line.startswith("INTIGRITI_APP="):
+                    v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if v:
+                        return v
+    except OSError:
+        pass
+    return ""
+
+
+def _api_get(path, token, params=None):
+    url = API_BASE + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _die(msg, code=2):
+    sys.stderr.write("pihunt-updates: " + msg + "\n")
+    sys.exit(code)
+
+
+def _snapshot_dir(prog):
+    return os.path.join(ROOT, "reports", prog, "live-intel")
+
+
+def _snapshots(prog):
+    """All update snapshots for a program, oldest-first (by filename utc stamp)."""
+    d = _snapshot_dir(prog)
+    if not os.path.isdir(d):
+        return []
+    out = sorted(f for f in os.listdir(d) if f.startswith("updates-") and f.endswith(".json"))
+    return [os.path.join(d, f) for f in out]
+
+
+def _load(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _fp_from_program(p):
+    """Build the fingerprint we diff on from a /programs/{guid} payload."""
+    dom = p.get("domains") or {}
+    roe = p.get("rulesOfEngagement") or {}
+    status = p.get("status") or {}
+    return {
+        "name": p.get("name"),
+        "handle": p.get("handle"),
+        "guid": p.get("id"),
+        "status": status.get("value") if isinstance(status, dict) else status,
+        "domainsVersionId": dom.get("id") if isinstance(dom, dict) else None,
+        "domainsCreatedAt": dom.get("createdAt") if isinstance(dom, dict) else None,
+        "domainsCount": len(dom.get("content", [])) if isinstance(dom, dict) and isinstance(dom.get("content"), list) else None,
+        "roeVersionId": roe.get("id") if isinstance(roe, dict) else None,
+        "roeCreatedAt": roe.get("createdAt") if isinstance(roe, dict) else None,
+    }
+
+
+def _resolve_guid(prog, token):
+    """handle (program slug) -> program GUID via /programs list."""
+    data = _api_get("/programs", token, {"limit": 500})
+    recs = data.get("records", []) if isinstance(data, dict) else []
+    low = prog.lower()
+    for r in recs:
+        if str(r.get("handle", "")).lower() == low or str(r.get("name", "")).lower() == low:
+            return r.get("id")
+    return None
+
+
+def _scan_activities(guid, token, pages):
+    """Bounded best-effort scan of the GLOBAL activities feed for this program's
+    records. The feed is newest-first and very deep, so we cap at `pages`."""
+    found = []
+    for i in range(max(0, pages)):
+        try:
+            data = _api_get("/programs/activities", token, {"limit": PAGE_SIZE, "offset": i * PAGE_SIZE})
+        except Exception:
+            break
+        recs = data.get("records", []) if isinstance(data, dict) else []
+        if not recs:
+            break
+        found.extend(r for r in recs if r.get("programId") == guid)
+        if len(recs) < PAGE_SIZE:
+            break
+    return found
+
+
+def _fmt_ts(epoch):
+    if not epoch:
+        return "?"
+    try:
+        return datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        return str(epoch)
+
+
+def _diff(prev_fp, cur_fp):
+    """Structured change entries between two fingerprints (empty = no change).
+    Each entry: {kind, text}. `kind` lets us correlate with a feed event type."""
+    if not prev_fp:
+        return []
+    out = []
+    if prev_fp.get("status") != cur_fp.get("status"):
+        out.append({"kind": "status",
+                    "text": f"program status changed: {prev_fp.get('status')} -> {cur_fp.get('status')}"})
+    if prev_fp.get("domainsVersionId") != cur_fp.get("domainsVersionId"):
+        out.append({"kind": "domains-version",
+                    "text": f"NEW scope (domains) version: {_fmt_ts(cur_fp.get('domainsCreatedAt'))} "
+                            f"(was {_fmt_ts(prev_fp.get('domainsCreatedAt'))}); re-run the scope-loader and diff assets"})
+    elif prev_fp.get("domainsCount") != cur_fp.get("domainsCount") and cur_fp.get("domainsCount") is not None:
+        out.append({"kind": "domains-count",
+                    "text": f"scope asset count changed: {prev_fp.get('domainsCount')} -> {cur_fp.get('domainsCount')} (same version id)"})
+    if prev_fp.get("roeVersionId") != cur_fp.get("roeVersionId"):
+        out.append({"kind": "roe-version",
+                    "text": f"NEW rules-of-engagement version: {_fmt_ts(cur_fp.get('roeCreatedAt'))} "
+                            f"(was {_fmt_ts(prev_fp.get('roeCreatedAt'))}); re-read ROE before the next active probe"})
+    return out
+
+
+# Map a change kind to the activities-feed event type.value that records it.
+_FEED_TYPE = {
+    "status": "New program status available",
+    "domains-version": "New domains version added",
+    "roe-version": "New rules of engagement version added",
+}
+
+
+def _match_activity(kind, cur_fp, activities):
+    """Find the feed record that corresponds to a detected change, so we can attach
+    its human-readable transition. Prefer an exact version-id/status match, else the
+    most recent event of the right type for this program."""
+    want_type = _FEED_TYPE.get(kind)
+    if not want_type or not activities:
+        return None
+    cand = [r for r in activities if r.get("type", {}).get("value") == want_type]
+    if not cand:
+        return None
+    if kind == "domains-version":
+        for r in cand:
+            if r.get("activity", {}).get("toVersionId") == cur_fp.get("domainsVersionId"):
+                return r
+    elif kind == "roe-version":
+        for r in cand:
+            if r.get("activity", {}).get("toVersionId") == cur_fp.get("roeVersionId"):
+                return r
+    elif kind == "status":
+        for r in cand:
+            if r.get("activity", {}).get("toStatus", {}).get("value") == cur_fp.get("status"):
+                return r
+    # Fall back to the newest event of this type (feed is newest-first).
+    return cand[0]
+
+
+def _correlate_suffix(rec):
+    """Human-readable suffix for a matched feed record."""
+    if not rec:
+        return ""
+    act = rec.get("activity", {}) or {}
+    when = _fmt_ts(rec.get("createdAt"))
+    if "fromStatus" in act or "toStatus" in act:
+        return f"  [feed @ {when}: {act.get('fromStatus', {}).get('value')} -> {act.get('toStatus', {}).get('value')}]"
+    if "toVersionId" in act:
+        frm = (act.get("fromVersionId") or "")[:8]
+        to = (act.get("toVersionId") or "")[:8]
+        return f"  [feed @ {when}: version {frm} -> {to}]"
+    return f"  [feed @ {when}]"
+
+
+def _change_lines(changes, cur_fp=None, activities=None):
+    """Render structured change entries to strings, attaching correlated feed text
+    when an activity record matches."""
+    lines = []
+    for c in changes:
+        line = c["text"]
+        if cur_fp is not None:
+            rec = _match_activity(c["kind"], cur_fp, activities)
+            line += _correlate_suffix(rec)
+        lines.append(line)
+    return lines
+
+
+def cmd_fetch(argv):
+    prog = _resolve_program(argv)
+    try:
+        pages = int(_opt(argv, "--pages", "0"))
+    except ValueError:
+        _die("--pages expects an integer")
+    token = _token()
+    if not token:
+        _die("no INTIGRITI_APP token ($INTIGRITI_APP or ~/.pi/secrets/intigriti.env). "
+             "`show` still works offline.")
+    try:
+        guid = _resolve_guid(prog, token)
+    except urllib.error.HTTPError as e:
+        _die(f"programs list HTTP {e.code} (401/403 => token lacks access). Handle: {prog}")
+    except Exception as e:
+        _die(f"programs list failed: {e}")
+    if not guid:
+        _die(f"handle {prog!r} not found in researcher program list (no guessing — exact handle only)")
+    try:
+        prog_payload = _api_get(f"/programs/{guid}", token)
+    except Exception as e:
+        _die(f"program detail failed: {e}")
+    cur_fp = _fp_from_program(prog_payload)
+
+    snaps = _snapshots(prog)
+    prev = _load(snaps[-1]) if snaps else None
+    prev_fp = prev.get("fingerprint") if isinstance(prev, dict) else None
+    changes = _diff(prev_fp, cur_fp)
+
+    # Scan the activities feed when the caller forced --pages, OR (auto) when a change
+    # was detected so we can correlate it with its human-readable transition event.
+    explicit = "--pages" in argv
+    scan_pages = pages if explicit else (CORRELATE_PAGES if changes else 0)
+    activities = _scan_activities(guid, token, scan_pages) if scan_pages > 0 else []
+
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    snap = {
+        "schema": 1,
+        "program": prog,
+        "fetchedAt": stamp,
+        "fingerprint": cur_fp,
+        "activitiesScanned": {"pages": scan_pages, "pageSize": PAGE_SIZE, "matched": len(activities),
+                              "auto": bool(not explicit and changes)},
+        "activities": activities,
+        "note": "Snapshot of the Intigriti program fingerprint (scope/ROE version ids + status). "
+                "No credentials stored. activities[] is a bounded best-effort scan of the global feed.",
+    }
+    outdir = _snapshot_dir(prog)
+    os.makedirs(outdir, exist_ok=True)
+    outpath = os.path.join(outdir, f"updates-{stamp}.json")
+    with open(outpath, "w") as fh:
+        json.dump(snap, fh, indent=2)
+
+    print(f"# Program updates — {prog}")
+    print(f"snapshot: reports/{prog}/live-intel/updates-{stamp}.json")
+    print(f"status: {cur_fp.get('status')} | scope v{_fmt_ts(cur_fp.get('domainsCreatedAt'))} "
+          f"({cur_fp.get('domainsCount')} assets) | ROE v{_fmt_ts(cur_fp.get('roeCreatedAt'))}")
+    if prev_fp is None:
+        print("baseline snapshot written (no prior snapshot to diff).")
+    elif changes:
+        print("\n!! CHANGE DETECTED since last snapshot:")
+        for line in _change_lines(changes, cur_fp, activities):
+            print(f"  - {line}")
+    else:
+        print("no change since last snapshot.")
+    if explicit and pages > 0:
+        print(f"\nactivities feed: scanned {pages} page(s), {len(activities)} record(s) for this program.")
+        for r in activities[:int(_opt(argv, '--limit', '10'))]:
+            print(f"  - {_fmt_ts(r.get('createdAt'))} {r.get('type', {}).get('value', '?')}")
+    sys.exit(10 if (prev_fp is not None and changes) else 0)
+
+
+def cmd_show(argv):
+    prog = _resolve_program(argv)
+    new_only = "--new" in argv
+    try:
+        limit = int(_opt(argv, "--limit", "5"))
+    except ValueError:
+        limit = 5
+    snaps = _snapshots(prog)
+    if not snaps:
+        print(f"# Program updates — {prog}")
+        print("no snapshot yet — run `pihunt-updates fetch` to seed the updates feed.")
+        return
+    cur = _load(snaps[-1]) or {}
+    cur_fp = cur.get("fingerprint", {})
+    prev_fp = (_load(snaps[-2]) or {}).get("fingerprint") if len(snaps) >= 2 else None
+    changes = _diff(prev_fp, cur_fp)
+
+    print(f"# Program updates — {prog}")
+    print(f"last checked: {cur.get('fetchedAt', '?')} | status: {cur_fp.get('status')} | "
+          f"scope v{_fmt_ts(cur_fp.get('domainsCreatedAt'))} ({cur_fp.get('domainsCount')} assets) | "
+          f"ROE v{_fmt_ts(cur_fp.get('roeCreatedAt'))}")
+    if changes:
+        print("!! CHANGE since previous snapshot:")
+        for line in _change_lines(changes, cur_fp, cur.get("activities", [])):
+            print(f"  - {line}")
+    elif not new_only:
+        print("no change vs previous snapshot.")
+    if not new_only:
+        acts = cur.get("activities", []) or []
+        for r in acts[:limit]:
+            print(f"  · {_fmt_ts(r.get('createdAt'))} {r.get('type', {}).get('value', '?')}")
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd = argv[0]
+    if cmd == "fetch":
+        cmd_fetch(argv[1:])
+    elif cmd == "show":
+        cmd_show(argv[1:])
+    else:
+        _die(f"unknown command {cmd!r} (fetch|show). See --help.")
+
+
+if __name__ == "__main__":
+    main()
