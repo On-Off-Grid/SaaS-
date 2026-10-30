@@ -28,6 +28,13 @@ const REPO = path.resolve(HERE, "..");
 const SRC = path.join(REPO, "pi-agent", "prompts");
 const DEPLOY = path.join(process.env.HOME, ".pi", "agent", "agents");
 const MIRROR = path.join(REPO, "pi-agent", "agents");
+// The deployed tree is "rehomed": install.sh expands this placeholder to the real
+// $HOME so an agent can reference an absolute path (e.g. deep-research's memory dir).
+// The repo mirror keeps the placeholder (machine-neutral). We mirror that rule here:
+// the deploy is written + compared rehomed, the mirror placeholder-preserved — so a
+// home-path agent no longer reads as permanent drift against the build.
+const HOME = process.env.HOME;
+const OLD_HOME = "__PIHUNT_HOME__";
 
 const args = process.argv.slice(2);
 const DRY = args.includes("--dry");
@@ -135,14 +142,19 @@ for (const s of sources) {
   totalTok += Math.max(tok, 0);
   const cur = (!REPO_ONLY && fs.existsSync(target)) ? fs.readFileSync(target, "utf8") : null;
   const mir = fs.existsSync(mirror) ? fs.readFileSync(mirror, "utf8") : null;
-  const same = REPO_ONLY ? (mir !== null && mir === built) : (cur === built && (mir === null || mir === built));
+  // Rehome-normalize: compare/write the deploy with the placeholder expanded to $HOME,
+  // the mirror with it preserved. `.split().join()` is a no-op on files without the token.
+  const builtDeploy = HOME ? built.split(OLD_HOME).join(HOME) : built;
+  const curSame = cur === builtDeploy;
+  const mirSame = mir === built;
+  const same = REPO_ONLY ? (mir !== null && mirSame) : (curSame && (mir === null || mirSame));
   rows.push({ name: src.fm.name, cls: s.cls, tokens: tok, drift: !same && (REPO_ONLY ? mir !== null : cur !== null) });
 
   if (CHECK) {
     if (REPO_ONLY) {
-      if (mir === null || mir !== built) { drift++; console.error(`DRIFT (repo mirror): ${src.fm.name}.md`); }
-    } else if (!same && cur !== null) { drift++; console.error(`DRIFT: ${src.fm.name}.md`); }
-    else if (mir !== null && mir !== built) { drift++; console.error(`DRIFT (repo mirror): ${src.fm.name}.md`); }
+      if (mir === null || !mirSame) { drift++; console.error(`DRIFT (repo mirror): ${src.fm.name}.md`); }
+    } else if (!curSame && cur !== null) { drift++; console.error(`DRIFT: ${src.fm.name}.md`); }
+    else if (mir !== null && !mirSame) { drift++; console.error(`DRIFT (repo mirror): ${src.fm.name}.md`); }
     continue;
   }
   if (DRY) {
@@ -150,7 +162,7 @@ for (const s of sources) {
     continue;
   }
   if (REPO_ONLY) {
-    if (mir !== null && mir !== built) fs.copyFileSync(mirror, `${mirror}.bak-${ts()}`);
+    if (mir !== null && !mirSame) fs.copyFileSync(mirror, `${mirror}.bak-${ts()}`);
     fs.writeFileSync(mirror, built);
     continue;
   }
@@ -158,8 +170,8 @@ for (const s of sources) {
     fs.copyFileSync(target, `${target}.bak-${ts()}`);
     if (fs.existsSync(mirror)) fs.copyFileSync(mirror, `${mirror}.bak-${ts()}`);
   }
-  fs.writeFileSync(target, built);
-  fs.writeFileSync(mirror, built);
+  fs.writeFileSync(target, builtDeploy);   // deploy: rehomed to $HOME
+  fs.writeFileSync(mirror, built);          // mirror: placeholder preserved
 }
 
 const W = (n, w) => String(n).padEnd(w);
