@@ -86,11 +86,18 @@ prints `(no pattern mapped)` rather than forcing a bad fit. Matching is by the c
 `maps_to`/`pattern` tag or a `grant_match` prefix against the chain's granted
 capability, so a new chain that grants a known class auto-links.
 
-### 5. `pihunt-gadgets triggers` — what recon just unlocked
-Re-arm triggers. `ARMED` = a previously-killed case is **reopenable right now** because
-its missing capability showed up. `WAITING` = still needs a named capability from
-recon. Scan this after any recon pass: an `ARMED` line is free re-hunt of a bug you
-already scoped.
+### 5. `pihunt-gadgets triggers` — what recon (or a scope change) just unlocked
+Re-arm triggers. `ARMED` = a previously-killed case is **reopenable right now**;
+`WAITING` = still needs its condition. A trigger arms on ANY of three conditions
+(each ARMED line prints *why*):
+- `when_capability` — a confirmed gadget now grants the capability (recon found it).
+- `when_scope_added` — a matching asset just **entered scope** (from the `pihunt-updates`
+  delta) — e.g. an OOS-gated dead-end re-opens the day the program adds that asset.
+- `when_status` — the program status now equals the value (e.g. `Open`).
+
+Scan this after any recon pass **or program-updates fetch**: an `ARMED` line is a free
+re-hunt of a bug you already scoped. `pihunt-gadgets check` (exit 10 on any ARMED) is
+run by the recon stage and surfaced in the session brief.
 
 ---
 

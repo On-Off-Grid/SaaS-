@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """pihunt-gadgets — synthesise the gadget graph into escalation leverage.
 
-Reads a per-program capability graph (gadget-graph.jsonl) and re-arm triggers
-(rearm-triggers.jsonl), and answers the one question a flat vector list can't:
-*which single missing primitive, if obtained, unblocks the most (and highest-tier)
-escalation chains?*
+Reads a per-program capability graph (gadget-graph.jsonl), re-arm triggers
+(rearm-triggers.jsonl), and the latest program-updates snapshot (live-intel/
+updates-*.json, written by `pihunt-updates`), and answers the one question a flat
+vector list can't: *which single missing primitive, if obtained, unblocks the most
+(and highest-tier) escalation chains?*
+
+A re-arm trigger arms on ANY of: when_capability (a confirmed gadget now grants it),
+when_scope_added (a matching asset just entered scope — from the updates delta), or
+when_status (the program status now equals the value, e.g. "Open"). The scope/status
+conditions close the loop from `pihunt-updates` so an Intigriti scope change re-opens
+a parked dead-end. RAG is NOT read here: it is the agents' store (updates feed RAG via
+the scope-loader; the hunters write results back into gadget-graph.jsonl, which this
+tool synthesises).
 
 Model
 -----
