@@ -56,6 +56,23 @@ your Brave (one-time, manual — a browser extension can't be installed by the a
 `claude-in-chrome` is the alternative Claude Code → browser path (its own extension +
 site permissions); use whichever you have connected.
 
+### "Installation is not enabled" when adding the extension
+
+That error means extensions are OFF in the window you're installing into. The agents'
+**browser-live runs with `--disable-extensions`** (determinism for the hunters), so you
+cannot install there — and while the agents hold a profile you can't open a second
+window on it either. Options:
+
+- **Install in a window that allows extensions:** your everyday Brave, or a dedicated
+  operator profile (`hunt-browser open operator`). The Claude Code link works against
+  any Brave the extension is connected to. (The "Google recommends using Chrome" line
+  on the Web Store is a cosmetic nag — click "Add to Brave".)
+- **Drive the agents' own logged-in browser:** set `BROWSER_LIVE_ALLOW_EXTENSIONS=1`
+  (in `mcp-config/mcp.json`'s browser-live env, or the launch shell) and restart `pi`.
+  browser-live then keeps extensions enabled, so you install Browser MCP directly in
+  its visible window and `mcp__browsermcp` drives the browser the hunters use. Off by
+  default.
+
 ## Switching the browser binary
 
 `BROWSER_LIVE_CHROME_BIN` (set in `mcp-config/mcp.json`, default `/usr/bin/brave-browser`)

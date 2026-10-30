@@ -121,14 +121,19 @@ build_chrome_args() {
     --disable-background-networking
     --disable-sync
     --disable-translate
-    --disable-extensions
-    --disable-component-extensions-with-background-pages
     --disable-default-apps
     --disable-features=TranslateUI
     --disable-dev-shm-usage
     --lang=en-US
     --window-size=1440,900
   )
+  # Extensions are OFF by default (determinism/stability for the automated hunters).
+  # Set BROWSER_LIVE_ALLOW_EXTENSIONS=1 to allow them — e.g. so you can install the
+  # Browser MCP extension in this same window and drive the agents' logged-in browser
+  # from Claude Code. (Without it, the Web Store reports "installation is not enabled".)
+  if [[ "${BROWSER_LIVE_ALLOW_EXTENSIONS:-0}" != "1" ]]; then
+    CHROME_ARGS+=(--disable-extensions --disable-component-extensions-with-background-pages)
+  fi
   if [[ "$CHROME_HEADLESS" == "1" ]]; then
     CHROME_ARGS+=(--headless=new)
   fi
@@ -364,7 +369,8 @@ stop_existing_monitor
 # session (setsid) so kiro-cli killing the MCP bridge's process group can
 # never take the reaper down — guaranteeing Chrome is always reaped.
 export HOST PORT PROFILE_DIR LOG_DIR LOCK_FILE PID_FILE MONITOR_PID_FILE \
-  OWNERS_DIR DEBUG_URL CHROME_BIN MAX_TABS HEALTH_FAILURE_THRESHOLD CHROME_HEADLESS
+  OWNERS_DIR DEBUG_URL CHROME_BIN MAX_TABS HEALTH_FAILURE_THRESHOLD CHROME_HEADLESS \
+  BROWSER_LIVE_ALLOW_EXTENSIONS
 export -f check_browser build_chrome_args start_browser chrome_alive \
   count_live_owners kill_chrome_group wait_for_browser chrome_monitor_loop
 
