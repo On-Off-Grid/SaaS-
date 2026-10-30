@@ -82,8 +82,12 @@ if [ -z "\$REPO" ]; then
   echo "           Set PIHUNT_RAG_REPO to the repo's rag/ dir, or re-run rag/install-rag.sh from the repo." >&2
   exit 1
 fi
+# -P (PYTHONSAFEPATH): never prepend the launch cwd to sys.path, so a stray
+# module in the caller's directory (e.g. a leftover inspect.py) can't shadow
+# the stdlib and silently break model2vec's import -> hashed-ngram fallback in
+# the wrong vector space. The package is found via PYTHONPATH, never cwd.
 exec env PIHUNT_RAG_HOME="\$RAG_HOME" HF_HOME="\$RAG_HOME/data/hf" PYTHONPATH="\$REPO" \\
-  "\$RAG_HOME/.venv/bin/python" -m pihunt_rag.cli "\$@"
+  "\$RAG_HOME/.venv/bin/python" -P -m pihunt_rag.cli "\$@"
 WRAP
   chmod +x "$WRAPPER"
 fi
