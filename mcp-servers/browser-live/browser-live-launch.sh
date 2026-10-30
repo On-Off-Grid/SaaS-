@@ -20,20 +20,54 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 WORKSPACE="${BROWSER_LIVE_WORKSPACE:-$PWD}"
 HOST="${BROWSER_LIVE_HOST:-127.0.0.1}"
-CHROME_BIN="${BROWSER_LIVE_CHROME_BIN:-/opt/google/chrome/chrome}"
 
-# Derive a unique port per workspace (9300–9399) from path hash.
-# Override with BROWSER_LIVE_PORT if needed.
-WORKSPACE_HASH=$(echo -n "$WORKSPACE" | cksum | awk '{print $1}')
+# Browser binary: an explicit BROWSER_LIVE_CHROME_BIN wins; otherwise pick the first
+# installed of Brave / Chrome / Chromium. Brave is preferred (Chromium-based, so the
+# remote-debugging + user-data-dir mechanism is identical, and it takes the Browser
+# MCP extension used for the Claude Code link).
+CHROME_BIN="${BROWSER_LIVE_CHROME_BIN:-}"
+if [[ -z "$CHROME_BIN" ]]; then
+  for __b in /usr/bin/brave-browser /usr/bin/brave /opt/google/chrome/chrome \
+             /usr/bin/google-chrome /usr/bin/google-chrome-stable \
+             /usr/bin/chromium /usr/bin/chromium-browser; do
+    [[ -x "$__b" ]] && { CHROME_BIN="$__b"; break; }
+  done
+fi
+
+# Profile selection (issue: per-program persistent memory). A named profile
+# (BROWSER_LIVE_PROFILE) wins; else the active engagement program ($PIHUNT_PROGRAM,
+# or the program field of engagement.{local.}toml under the workspace); else
+# "default". Each profile is its OWN persistent Chrome user-data-dir, so a long-term
+# program's logins/credentials survive across sessions and never bleed between
+# programs, and the operator can re-open that exact profile to intervene.
+resolve_program() {
+  local f val
+  for f in "$WORKSPACE/config/engagement.local.toml" "$WORKSPACE/config/engagement.toml"; do
+    [[ -r "$f" ]] || continue
+    val="$(sed -n 's/^[[:space:]]*program[[:space:]]*=[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}.*/\1/p' "$f" \
+      | head -1 | tr -d '[:space:]')"
+    [[ -n "$val" ]] && { printf '%s' "$val"; return 0; }
+  done
+}
+PROFILE_NAME="${BROWSER_LIVE_PROFILE:-${PIHUNT_PROGRAM:-}}"
+[[ -z "$PROFILE_NAME" ]] && PROFILE_NAME="$(resolve_program)"
+[[ -z "$PROFILE_NAME" ]] && PROFILE_NAME="default"
+# Sanitize to a safe directory name.
+PROFILE_NAME="$(printf '%s' "$PROFILE_NAME" | tr -c 'A-Za-z0-9._-' '_')"
+PROFILE_ROOT="$WORKSPACE/.browser-live/profiles/$PROFILE_NAME"
+
+# Derive a unique port (9300–9399) per workspace+profile so different programs run
+# independent Chromes side by side. Override with BROWSER_LIVE_PORT if needed.
+WORKSPACE_HASH=$(echo -n "$WORKSPACE|$PROFILE_NAME" | cksum | awk '{print $1}')
 PORT="${BROWSER_LIVE_PORT:-$(( 9300 + WORKSPACE_HASH % 100 ))}"
 
-# Per-workspace paths
-PROFILE_DIR="$WORKSPACE/.browser-live/chrome-profile"
-LOG_DIR="$WORKSPACE/.browser-live/logs"
-LOCK_FILE="$WORKSPACE/.browser-live/chrome.lock"
-PID_FILE="$WORKSPACE/.browser-live/chrome.pid"
-MONITOR_PID_FILE="$WORKSPACE/.browser-live/monitor.pid"
-OWNERS_DIR="$WORKSPACE/.browser-live/owners"
+# Per-profile paths
+PROFILE_DIR="$PROFILE_ROOT/chrome-profile"
+LOG_DIR="$PROFILE_ROOT/logs"
+LOCK_FILE="$PROFILE_ROOT/chrome.lock"
+PID_FILE="$PROFILE_ROOT/chrome.pid"
+MONITOR_PID_FILE="$PROFILE_ROOT/monitor.pid"
+OWNERS_DIR="$PROFILE_ROOT/owners"
 MCP_PID="$$"
 DEBUG_URL="http://${HOST}:${PORT}/json/version"
 MCP_ENTRYPOINT="${BROWSER_LIVE_MCP_ENTRYPOINT:-$SCRIPT_DIR/browser-live-mcp-entry.mjs}"
@@ -316,8 +350,8 @@ fi
 # reaper never tears Chrome down while we are still attaching.
 register_owner
 
-printf '%s browser-live-launch: Chrome ready on port %s, profile at %s\n' \
-  "$(date -Is)" "$PORT" "$PROFILE_DIR" >> "$MONITOR_LOG_FILE"
+printf '%s browser-live-launch: %s ready on port %s, profile %s at %s\n' \
+  "$(date -Is)" "$(basename "$CHROME_BIN")" "$PORT" "$PROFILE_NAME" "$PROFILE_DIR" >> "$MONITOR_LOG_FILE"
 
 exec 9>&-
 

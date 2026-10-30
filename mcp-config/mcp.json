@@ -5,7 +5,7 @@
       "env": {
         "BROWSER_LIVE_CHROME_DEVTOOLS_MCP_ROOT": "__PIHUNT_HOME__/.local/share/browser-live/chrome-devtools-mcp/node_modules/chrome-devtools-mcp",
         "BROWSER_LIVE_USE_MCP_PROXY": "0",
-        "BROWSER_LIVE_CHROME_BIN": "/usr/bin/chromium",
+        "BROWSER_LIVE_CHROME_BIN": "/usr/bin/brave-browser",
         "BROWSER_LIVE_MAX_TABS": "10",
         "NODE_OPTIONS": "--max-old-space-size=512"
       },

@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# hunt-browser — operate the per-program browser-live profiles.
+#
+# The pi runtime's browser-live gives each engagement its OWN persistent Brave
+# profile (user-data-dir) under <workspace>/.browser-live/profiles/<program>/, so a
+# long-term program's logins/credentials survive across sessions. This tool lets the
+# OPERATOR work those profiles by hand — list them, print a path, or open one in Brave
+# to set up or inspect an account's credentials so the agents inherit that state.
+#
+#   hunt-browser list                 all profiles (size, last used, live?)
+#   hunt-browser path [program]       print a profile's user-data-dir
+#   hunt-browser open [program] [url] open the profile in Brave for you to drive
+#
+# A profile defaults to the active engagement program ($PIHUNT_PROGRAM or
+# engagement.{local.}toml), overridable by the argument. A Chrome user-data-dir can
+# only be held by ONE process: if the agents' browser-live Chrome is live on a
+# profile, `open` won't fight it — interact with the on-screen window instead.
+set -uo pipefail
+
+# Shared helpers (program resolution, repo-root discovery).
+for __l in "$(dirname "${BASH_SOURCE[0]}")/../lib/pihunt-common.sh" \
+           "$HOME/.local/lib/pihunt-common.sh" "${PIHUNT_REPO:-}/lib/pihunt-common.sh"; do
+  [ -r "$__l" ] && { . "$__l"; break; }
+done; unset __l
+
+# Workspace = repo root (where .browser-live lives). Walk up to a dir with reports/.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+d="$PWD"; while [ "$d" != "/" ]; do [ -d "$d/reports" ] && { REPO="$d"; break; }; d="$(dirname "$d")"; done
+WORKSPACE="${BROWSER_LIVE_WORKSPACE:-$REPO}"
+PROFILES_DIR="$WORKSPACE/.browser-live/profiles"
+
+resolve_browser() {
+  if [ -n "${BROWSER_LIVE_CHROME_BIN:-}" ] && [ -x "${BROWSER_LIVE_CHROME_BIN}" ]; then
+    printf '%s' "$BROWSER_LIVE_CHROME_BIN"; return 0
+  fi
+  local b
+  for b in /usr/bin/brave-browser /usr/bin/brave /opt/google/chrome/chrome \
+           /usr/bin/google-chrome /usr/bin/google-chrome-stable \
+           /usr/bin/chromium /usr/bin/chromium-browser; do
+    [ -x "$b" ] && { printf '%s' "$b"; return 0; }
+  done
+  return 1
+}
+
+# Mirror the launch script's profile selection.
+resolve_program() {
+  local p="${1:-}"
+  [ -n "$p" ] && { printf '%s' "$p"; return 0; }
+  p="${BROWSER_LIVE_PROFILE:-${PIHUNT_PROGRAM:-}}"
+  if [ -z "$p" ] && command -v pihunt_program >/dev/null 2>&1; then p="$(pihunt_program)"; fi
+  [ -z "$p" ] && p="default"
+  printf '%s' "$p" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+profile_root() { printf '%s/%s' "$PROFILES_DIR" "$1"; }
+
+# Is the agents' browser-live Chrome currently holding this profile?
+profile_live() { # $1=profile-root -> 0 if a live chrome.pid, else 1
+  local pid; pid="$(cat "$1/chrome.pid" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+cmd_list() {
+  printf '# browser-live profiles — %s\n' "$PROFILES_DIR"
+  if [ ! -d "$PROFILES_DIR" ]; then
+    echo "(none yet — a profile is created on first browser-live use for a program)"
+    return 0
+  fi
+  local any=0 p name live sz used
+  for p in "$PROFILES_DIR"/*/; do
+    [ -d "$p" ] || continue
+    any=1; name="$(basename "$p")"
+    profile_live "${p%/}" && live="LIVE (agents attached)" || live="idle"
+    sz="$(du -sh "$p/chrome-profile" 2>/dev/null | awk '{print $1}')"
+    used="$(date -r "$p/chrome-profile" '+%F %H:%M' 2>/dev/null || echo '?')"
+    printf '  %-24s %-22s %6s  last used %s\n' "$name" "$live" "${sz:-0}" "$used"
+  done
+  [ "$any" = 0 ] && echo "(none yet)"
+}
+
+cmd_path() { printf '%s\n' "$(profile_root "$(resolve_program "${1:-}")")/chrome-profile"; }
+
+cmd_open() {
+  local prog; prog="$(resolve_program "${1:-}")"
+  local url="${2:-about:blank}"
+  local root; root="$(profile_root "$prog")"
+  local prof="$root/chrome-profile"
+  local bin; bin="$(resolve_browser)" || { echo "hunt-browser: no Brave/Chrome/Chromium found" >&2; exit 2; }
+  if profile_live "$root"; then
+    echo "hunt-browser: profile '$prog' is LIVE — the agents' browser is holding it." >&2
+    echo "  A Chrome user-data-dir can't be opened twice. Interact with the on-screen" >&2
+    echo "  window, or stop the agents' browser first. Profile: $prof" >&2
+    exit 3
+  fi
+  mkdir -p "$prof"
+  echo "hunt-browser: opening '$prog' profile in $(basename "$bin") for intervention"
+  echo "  profile: $prof"
+  echo "  log in / complete flows here; the agents inherit this state next session."
+  setsid "$bin" --user-data-dir="$prof" --no-first-run --no-default-browser-check \
+    "$url" >/dev/null 2>&1 < /dev/null &
+  echo "  launched (pid $!)."
+}
+
+case "${1:-}" in
+  list|ls)     shift || true; cmd_list ;;
+  path)        shift || true; cmd_path "${1:-}" ;;
+  open)        shift || true; cmd_open "${1:-}" "${2:-}" ;;
+  -h|--help|help|"") sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  *) echo "hunt-browser: unknown command '${1}' (list|path|open). See --help." >&2; exit 2 ;;
+esac

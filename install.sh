@@ -43,7 +43,7 @@ for t in node npm python3 curl rsync; do command -v "$t" >/dev/null || { warn "M
 echo "   node $(node -v) | npm $(npm -v) | $(python3 -V) | $USER_NAME@$(hostname)"
 NODE_MAJ="$(node -v | sed 's/v\([0-9]*\).*/\1/')"; [ "$NODE_MAJ" -lt 22 ] 2>/dev/null && warn "node < 22 — pi 0.79.0 expects Node 22+."
 command -v java >/dev/null && ok "java present (burp MCP)" || warn "java NOT found — needed for the burp MCP proxy jar."
-{ command -v chromium >/dev/null || [ -x /usr/bin/chromium ] || command -v google-chrome >/dev/null; } && ok "chromium present (browser-live)" || warn "chromium NOT found — browser-live needs /usr/bin/chromium (or set BROWSER_LIVE_CHROME_BIN)."
+{ command -v brave-browser >/dev/null || [ -x /usr/bin/brave-browser ] || command -v google-chrome >/dev/null || command -v chromium >/dev/null || [ -x /usr/bin/chromium ]; } && ok "browser present (Brave/Chrome/Chromium) for browser-live" || warn "no Brave/Chrome/Chromium found — browser-live needs one (prefers Brave; or set BROWSER_LIVE_CHROME_BIN)."
 
 c "0/9  config: validate + compile (config/*.toml -> models.json + tier defaults)"
 if [ -f "$SRC/bin/pihunt-config" ]; then
@@ -141,7 +141,7 @@ else warn "rag/install-rag.sh not bundled — skipping RAG"; fi
 
 c "6/7  launchers  ->  $H/.local/bin"
 run "mkdir -p '$H/.local/bin'"
-for l in pi-hunt pi-tier pihunt-config pihunt-gadgets pihunt-authz pihunt-triage pihunt-updates pihunt-missions pihunt-profile pihunt-watchdog hunt-session hunt-brief submission-shots pihunt-scope-guard; do [ -f "$SRC/bin/$l" ] || continue; bk "$H/.local/bin/$l"; run "cp -p '$SRC/bin/$l' '$H/.local/bin/$l'"; rehome "$H/.local/bin/$l"; run "chmod +x '$H/.local/bin/$l'"; done
+for l in pi-hunt pi-tier pihunt-config pihunt-gadgets pihunt-authz pihunt-triage pihunt-updates pihunt-missions pihunt-profile pihunt-watchdog hunt-session hunt-brief hunt-browser submission-shots pihunt-scope-guard; do [ -f "$SRC/bin/$l" ] || continue; bk "$H/.local/bin/$l"; run "cp -p '$SRC/bin/$l' '$H/.local/bin/$l'"; rehome "$H/.local/bin/$l"; run "chmod +x '$H/.local/bin/$l'"; done
 ok "launchers: pi-hunt, pi-tier (cost tiering), hunt-session + hunt-brief (session routine), gadgets/authz/triage/updates, missions/profile/watchdog (observability), pihunt-scope-guard (Claude Code ROE PreToolUse guard)"
 # shared bash lib the tools source (repo-root discovery, engagement/program resolution, TOML reads)
 if [ -d "$SRC/lib" ]; then
