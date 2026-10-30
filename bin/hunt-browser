@@ -11,6 +11,18 @@
 #   hunt-browser path [program]       print a profile's user-data-dir
 #   hunt-browser open [program] [url] open the profile in Brave for you to drive
 #
+# Account-aware tab tracking (two-account authz testing — do1 vs do2):
+#   hunt-browser tabs                 every open tab labeled do1 / do2 / UNKNOWN + url
+#   hunt-browser open-account do2 [url]  create an incognito context, register it as do2
+#   hunt-browser whose-tab <targetId>    print the account, or exit non-zero if UNKNOWN
+#
+# The live browser-live Brave runs one default (persistent) context = account do1
+# (team afa0ac) and one ephemeral incognito context = account do2 (team d9c570),
+# with true cookie isolation. The account↔context map lives in the per-program
+# registry reports/<program>/live-intel/browser-accounts.json. whose-tab is
+# FAIL-CLOSED: if it cannot confidently resolve a tab's account it returns UNKNOWN
+# and exits non-zero — the cockpit must never act as the wrong account (ROE).
+#
 # A profile defaults to the active engagement program ($PIHUNT_PROGRAM or
 # engagement.{local.}toml), overridable by the argument. A Chrome user-data-dir can
 # only be held by ONE process: if the agents' browser-live Chrome is live on a
@@ -101,10 +113,229 @@ cmd_open() {
   echo "  launched (pid $!)."
 }
 
+# --- account-aware tab tracking (do1 / do2 double-profiling) ---------------
+#
+# Model: the browser-live Brave runs ONE window with two CDP browser contexts.
+#   do1 (team afa0ac) = the DEFAULT context = the existing persistent per-program
+#                        profile; present at launch; survives across sessions.
+#   do2 (team d9c570) = an EPHEMERAL incognito context created in the same window;
+#                        own cookie jar, wiped on close; the operator re-auths it
+#                        each session. True cookie isolation between do1 and do2.
+# The account↔browserContextId map is the only state this tool writes:
+#   reports/<program>/live-intel/browser-accounts.json
+
+# Locate the CDP shim (repo clone layout, then the deployed ~/.claude/mcp copy).
+resolve_targets_helper() {
+  local h
+  for h in "$(dirname "${BASH_SOURCE[0]}")/../mcp-servers/browser-live/browser-live-targets.mjs" \
+           "$HOME/.claude/mcp/browser-live-targets.mjs" \
+           "${PIHUNT_REPO:-}/mcp-servers/browser-live/browser-live-targets.mjs"; do
+    [ -r "$h" ] && { printf '%s' "$h"; return 0; }
+  done
+  return 1
+}
+
+# Derive the per-profile CDP debug port the SAME way browser-live-launch.sh does:
+# cksum of "<workspace>|<profile>", mapped into 9300–9399. BROWSER_LIVE_PORT wins.
+resolve_port() { # $1=profile
+  if [ -n "${BROWSER_LIVE_PORT:-}" ]; then printf '%s' "$BROWSER_LIVE_PORT"; return 0; fi
+  local h; h="$(printf '%s|%s' "$WORKSPACE" "$1" | cksum | awk '{print $1}')"
+  printf '%s' "$(( 9300 + h % 100 ))"
+}
+
+registry_file() { # $1=profile
+  printf '%s/reports/%s/live-intel/browser-accounts.json' "$WORKSPACE" "$1"
+}
+
+team_for() { case "$1" in do1) printf 'afa0ac' ;; do2) printf 'd9c570' ;; *) printf '' ;; esac; }
+
+# Upsert a context→account mapping into the registry (creates the file/dirs).
+registry_put() { # $1=regfile $2=bcid $3=account $4=team $5=kind $6=port
+  mkdir -p "$(dirname "$1")"
+  python3 - "$@" <<'PY'
+import json, os, sys, datetime
+regfile, bcid, account, team, kind, port = sys.argv[1:7]
+try:
+    with open(regfile) as fh: data = json.load(fh)
+except Exception:
+    data = {}
+ctx = data.setdefault("contexts", {})
+ctx[bcid] = {"account": account, "team": team, "kind": kind,
+             "port": int(port), "updated": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+tmp = regfile + ".tmp"
+with open(tmp, "w") as fh: json.dump(data, fh, indent=2); fh.write("\n")
+os.replace(tmp, regfile)
+PY
+}
+
+# Fetch the live targets JSON from the CDP shim, or fail with a clear message.
+fetch_targets() { # $1=port  -> prints JSON on stdout
+  local helper; helper="$(resolve_targets_helper)" || {
+    echo "hunt-browser: CDP helper browser-live-targets.mjs not found (repo or ~/.claude/mcp)" >&2; return 2; }
+  command -v node >/dev/null 2>&1 || { echo "hunt-browser: node not found on PATH" >&2; return 2; }
+  node "$helper" list --port "$1"
+}
+
+# Resolve every page target to an account label using the registry + the
+# default-context rule, and (for tabs) auto-register the default context as do1.
+# FAIL-CLOSED: a context that is neither registered nor the default = UNKNOWN.
+cmd_tabs() {
+  local prog port reg targets tf
+  prog="$(resolve_program "${1:-}")"
+  port="$(resolve_port "$prog")"
+  reg="$(registry_file "$prog")"
+  targets="$(fetch_targets "$port")" || exit $?
+  tf="$(mktemp "${TMPDIR:-/tmp}/hb-tabs.XXXXXX")"
+  printf '%s' "$targets" > "$tf"
+  # Auto-register the default context as do1 (record it "as it appears").
+  local def_bcid
+  def_bcid="$(python3 -c 'import sys,json
+d=json.load(open(sys.argv[1]))
+for t in d["targets"]:
+    if t.get("isDefaultContext") and t.get("browserContextId"):
+        print(t["browserContextId"]); break' "$tf")"
+  if [ -n "$def_bcid" ]; then
+    local have=""
+    [ -r "$reg" ] && have="$(python3 -c 'import sys,json;d=json.load(open(sys.argv[1]));print("y" if sys.argv[2] in d.get("contexts",{}) else "")' "$reg" "$def_bcid" 2>/dev/null)"
+    [ -z "$have" ] && registry_put "$reg" "$def_bcid" "do1" "$(team_for do1)" "default" "$port"
+  fi
+  printf '# tabs — program %s  (CDP port %s)\n' "$prog" "$port"
+  python3 - "$reg" "$tf" <<'PY'
+import sys, json
+reg, tf = sys.argv[1], sys.argv[2]
+try:
+    with open(reg) as fh: contexts = json.load(fh).get("contexts", {})
+except Exception:
+    contexts = {}
+data = json.load(open(tf))
+pages = [t for t in data["targets"] if t.get("type") == "page"]
+if not pages:
+    print("  (no open tabs)")
+for t in pages:
+    bcid = t.get("browserContextId")
+    ent = contexts.get(bcid)
+    if ent:
+        label = ent["account"]
+    elif t.get("isDefaultContext"):
+        label = "do1"
+    else:
+        label = "UNKNOWN"
+    print(f"  {label:<8} {t.get('url','')[:90]:<90}  [{t.get('targetId')}]")
+PY
+  rm -f "$tf"
+}
+
+cmd_open_account() {
+  local account="${1:-}" prog port reg url helper out bcid tid
+  if [ "$account" != "do2" ]; then
+    echo "hunt-browser: open-account only creates 'do2' (do1 is the default context)." >&2
+    echo "  usage: hunt-browser open-account do2 [url]" >&2
+    exit 2
+  fi
+  prog="$(resolve_program "")"   # account is arg1; program comes from engagement
+  port="$(resolve_port "$prog")"
+  reg="$(registry_file "$prog")"
+  url="${2:-about:blank}"
+  helper="$(resolve_targets_helper)" || { echo "hunt-browser: CDP helper not found" >&2; exit 2; }
+  command -v node >/dev/null 2>&1 || { echo "hunt-browser: node not found on PATH" >&2; exit 2; }
+  echo "hunt-browser: creating an incognito (do2) context in the live browser-live window (port $port)"
+  if out="$(node "$helper" create-context --port "$port" --url "$url" 2>/tmp/.hb-oa.$$)"; then
+    bcid="$(printf '%s' "$out" | python3 -c 'import sys,json;print(json.load(sys.stdin)["browserContextId"])')"
+    tid="$(printf '%s' "$out" | python3 -c 'import sys,json;print(json.load(sys.stdin)["targetId"])')"
+    registry_put "$reg" "$bcid" "do2" "$(team_for do2)" "incognito" "$port"
+    rm -f /tmp/.hb-oa.$$
+    echo "  created incognito context $bcid  (tab targetId $tid)"
+    echo "  registered as do2 / team d9c570 in: $reg"
+    echo "  -> switch to that new tab in the on-screen Brave window and LOG IN as do2."
+    echo "     do2's cookies are isolated from do1 and are wiped when the context closes."
+    return 0
+  fi
+  # Fallback: Target.createBrowserContext not drivable on this stack.
+  echo "hunt-browser: could not create the context via CDP:" >&2
+  sed 's/^/    /' /tmp/.hb-oa.$$ >&2 2>/dev/null; rm -f /tmp/.hb-oa.$$
+  echo "" >&2
+  echo "  FALLBACK (manual incognito): in the on-screen browser-live Brave window open a" >&2
+  echo "  new incognito/private window (Ctrl+Shift+N) and load a page, then run:" >&2
+  echo "      hunt-browser open-account do2 --detect" >&2
+  echo "  to auto-detect that new context and register it as do2." >&2
+  exit 4
+}
+
+# Fallback registration: detect the first non-default (created/incognito) context
+# and register it as do2. Used after the operator opens incognito by hand.
+cmd_open_account_detect() {
+  local prog port reg out bcid
+  prog="$(resolve_program "")"
+  port="$(resolve_port "$prog")"
+  reg="$(registry_file "$prog")"
+  local helper; helper="$(resolve_targets_helper)" || { echo "hunt-browser: CDP helper not found" >&2; exit 2; }
+  out="$(node "$helper" detect-created --port "$port")" || exit $?
+  bcid="$(printf '%s' "$out" | python3 -c 'import sys,json
+c=json.load(sys.stdin).get("createdContextIds",[])
+print(c[0] if c else "")')"
+  if [ -z "$bcid" ]; then
+    echo "hunt-browser: no non-default (incognito) context found — open an incognito window first." >&2
+    exit 4
+  fi
+  registry_put "$reg" "$bcid" "do2" "$(team_for do2)" "incognito" "$port"
+  echo "hunt-browser: detected incognito context $bcid, registered as do2 / team d9c570"
+  echo "  registry: $reg  -> log in as do2 in that window."
+}
+
+# FAIL-CLOSED resolver the cockpit calls before acting as an account.
+cmd_whose_tab() {
+  local tid="${1:-}" prog port reg targets
+  [ -n "$tid" ] || { echo "hunt-browser: usage: whose-tab <targetId>" >&2; exit 2; }
+  prog="$(resolve_program "")"
+  port="$(resolve_port "$prog")"
+  reg="$(registry_file "$prog")"
+  targets="$(fetch_targets "$port")" || exit $?
+  local tf rc; tf="$(mktemp "${TMPDIR:-/tmp}/hb-whose.XXXXXX")"
+  printf '%s' "$targets" > "$tf"
+  python3 - "$reg" "$tid" "$tf" <<'PY'
+import sys, json
+reg, tid, tf = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(reg) as fh: contexts = json.load(fh).get("contexts", {})
+except Exception:
+    contexts = {}
+data = json.load(open(tf))
+match = next((t for t in data["targets"] if t.get("targetId") == tid), None)
+if match is None:
+    sys.stderr.write(f"hunt-browser: no tab with targetId {tid}\n")
+    sys.exit(2)
+bcid = match.get("browserContextId")
+ent = contexts.get(bcid)
+if ent:
+    acct, team = ent["account"], ent["team"]
+elif match.get("isDefaultContext"):
+    acct, team = "do1", "afa0ac"
+else:
+    # Not registered and not the default context — refuse to guess.
+    print("UNKNOWN")
+    sys.stderr.write("hunt-browser: tab's account could not be confidently resolved (fail-closed)\n")
+    sys.exit(4)
+print(f"{acct} {team} {match.get('url','')}")
+PY
+  rc=$?
+  rm -f "$tf"
+  exit $rc
+}
+
 case "${1:-}" in
   list|ls)     shift || true; cmd_list ;;
   path)        shift || true; cmd_path "${1:-}" ;;
   open)        shift || true; cmd_open "${1:-}" "${2:-}" ;;
-  -h|--help|help|"") sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
-  *) echo "hunt-browser: unknown command '${1}' (list|path|open). See --help." >&2; exit 2 ;;
+  tabs)        shift || true; cmd_tabs "${1:-}" ;;
+  open-account)
+    shift || true
+    if [ "${2:-}" = "--detect" ] || [ "${1:-}" = "--detect" ]; then
+      # `open-account do2 --detect` or `open-account --detect`
+      cmd_open_account_detect
+    else
+      cmd_open_account "${1:-}" "${2:-}"
+    fi ;;
+  whose-tab)   shift || true; cmd_whose_tab "${1:-}" ;;
+  -h|--help|help|"") sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  *) echo "hunt-browser: unknown command '${1}' (list|path|open|tabs|open-account|whose-tab). See --help." >&2; exit 2 ;;
 esac
