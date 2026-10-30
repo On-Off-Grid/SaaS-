@@ -33,6 +33,8 @@ Default program: from config/engagement.toml (or $PIHUNT_PROGRAM / --program).
 import json
 import os
 import sys
+import glob as _glob
+import fnmatch
 
 TIERS = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 def _find_root():
@@ -314,13 +316,74 @@ def cmd_patterns(prog, out=sys.stdout):
     return pats
 
 
+def load_updates(prog):
+    """Latest Intigriti program-updates snapshot (written by `pihunt-updates`):
+    returns (current_status, delta). delta carries assetsAdded/assetsRemoved +
+    status/version change flags. Empty when no snapshot exists — a program with no
+    updates tracking simply never arms a scope/status trigger."""
+    d = os.path.join(ROOT, "reports", prog, "live-intel")
+    snaps = sorted(_glob.glob(os.path.join(d, "updates-*.json")))
+    if not snaps:
+        return None, {}
+    try:
+        with open(snaps[-1]) as fh:
+            snap = json.load(fh)
+    except Exception:
+        return None, {}
+    return (snap.get("fingerprint", {}).get("status"), snap.get("delta", {}) or {})
+
+
+def _asset_match(pattern, assets):
+    """Assets matching a trigger's when_scope_added pattern. Matches as a shell glob
+    (so `*.digitaloceanspaces.com` works) and as a plain substring."""
+    hits = []
+    for a in assets:
+        if fnmatch.fnmatch(a, pattern) or pattern in a:
+            hits.append(a)
+    return hits
+
+
+def trigger_cond(t):
+    """Short human description of a trigger's arming condition (for display)."""
+    if t.get("when_capability"):
+        return f"cap: {t['when_capability']}"
+    if t.get("when_scope_added"):
+        return f"scope-added: {t['when_scope_added']}"
+    if t.get("when_status"):
+        return f"status: {t['when_status']}"
+    return "(no condition)"
+
+
 def eval_triggers(prog):
+    """A trigger arms when ANY of its conditions is met:
+      when_capability  — the capability now exists in the graph's granted set
+      when_scope_added — a matching asset just entered scope (updates snapshot delta)
+      when_status      — the program status now equals this value (e.g. "Open")
+    The capability condition is the original graph-internal signal; the scope/status
+    conditions close the loop from `pihunt-updates` so an Intigriti scope change can
+    re-open a parked dead-end. Each armed trigger is annotated with `_why`."""
     _, _, granted, _ = load_graph(prog)
+    status, delta = load_updates(prog)
+    added = delta.get("assetsAdded", []) or []
     trigs = [t for t in load_jsonl(os.path.join(recon_dir(prog), "rearm-triggers.jsonl"))
              if t.get("kind") != "meta"]
     armed, waiting = [], []
     for t in trigs:
-        (armed if t.get("when_capability") in granted else waiting).append(t)
+        why = None
+        cap = t.get("when_capability")
+        if cap and cap in granted:
+            why = f"capability granted: {cap}"
+        if not why and t.get("when_scope_added"):
+            hits = _asset_match(t["when_scope_added"], added)
+            if hits:
+                why = "asset entered scope: " + ", ".join(hits)
+        if not why and t.get("when_status") and status == t.get("when_status"):
+            why = f"program status = {status}"
+        if why:
+            t["_why"] = why
+            armed.append(t)
+        else:
+            waiting.append(t)
     return armed, waiting
 
 
@@ -328,17 +391,17 @@ def cmd_triggers(prog, out=sys.stdout):
     armed, waiting = eval_triggers(prog)
     print(f"# Re-arm triggers — {prog}\n", file=out)
     if armed:
-        print("## ARMED — a watched capability now exists; spend budget here:\n", file=out)
+        print("## ARMED — a watched condition now holds; spend budget here:\n", file=out)
         for t in armed:
-            print(f"  ★ {t['id']}  (cap: {t['when_capability']})", file=out)
+            print(f"  ★ {t['id']}  ({t.get('_why', trigger_cond(t))})", file=out)
             print(f"      reopen: {', '.join(t.get('reopen_cases', [])) or '-'} | "
                   f"arms: {', '.join(t.get('arms_chains', [])) or '-'}", file=out)
             print(f"      action: {t.get('action','')}\n", file=out)
     else:
         print("## ARMED: none\n", file=out)
-    print("## WAITING — watch recon for these capabilities:\n", file=out)
+    print("## WAITING — watch recon / scope for these conditions:\n", file=out)
     for t in waiting:
-        print(f"  · {t['id']:<28} needs: {t['when_capability']}", file=out)
+        print(f"  · {t['id']:<28} needs: {trigger_cond(t)}", file=out)
         print(f"      source: {t.get('source','')}", file=out)
     return armed, waiting
 
@@ -359,7 +422,7 @@ def cmd_suggest(prog, out=sys.stdout):
         if armed:
             print("No live actionable primitive, but a re-arm trigger is ARMED:", file=out)
             for t in armed:
-                print(f"  ★ {t['id']} (cap {t['when_capability']}) -> "
+                print(f"  ★ {t['id']} ({t.get('_why', trigger_cond(t))}) -> "
                       f"{t.get('action','')}", file=out)
         else:
             print("No live actionable primitive and no armed trigger. Either every chain "

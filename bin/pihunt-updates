@@ -155,6 +155,12 @@ def _fp_from_program(p):
     dom = p.get("domains") or {}
     roe = p.get("rulesOfEngagement") or {}
     status = p.get("status") or {}
+    content = dom.get("content", []) if isinstance(dom, dict) else []
+    # The in-scope asset endpoints, deduped + sorted. Carried in the fingerprint so
+    # a fetch can diff the exact assets that entered/left scope (not just a count),
+    # which is what the gadget-graph re-arm triggers key on.
+    assets = sorted({c.get("endpoint") for c in content
+                     if isinstance(c, dict) and c.get("endpoint")})
     return {
         "name": p.get("name"),
         "handle": p.get("handle"),
@@ -162,9 +168,33 @@ def _fp_from_program(p):
         "status": status.get("value") if isinstance(status, dict) else status,
         "domainsVersionId": dom.get("id") if isinstance(dom, dict) else None,
         "domainsCreatedAt": dom.get("createdAt") if isinstance(dom, dict) else None,
-        "domainsCount": len(dom.get("content", [])) if isinstance(dom, dict) and isinstance(dom.get("content"), list) else None,
+        "domainsCount": len(content) if isinstance(content, list) else None,
         "roeVersionId": roe.get("id") if isinstance(roe, dict) else None,
         "roeCreatedAt": roe.get("createdAt") if isinstance(roe, dict) else None,
+        "assets": assets,
+    }
+
+
+def _scope_delta(prev_fp, cur_fp):
+    """Machine-readable change between two fingerprints, for downstream consumers
+    (the gadget-graph re-arm triggers). Always returns a dict; empty-ish when there
+    is no prior snapshot or nothing changed."""
+    prev = prev_fp or {}
+    # Only diff assets when the prior snapshot actually recorded an asset list.
+    # (A pre-schema snapshot has no "assets" key — treating its absence as "empty"
+    # would falsely report every current asset as newly added on the first upgraded
+    # fetch.) Assets can only really change alongside a domains version bump anyway.
+    prev_has_assets = isinstance(prev.get("assets"), list)
+    prev_assets = set(prev.get("assets") or [])
+    cur_assets = set(cur_fp.get("assets") or [])
+    return {
+        "statusFrom": prev.get("status"),
+        "statusTo": cur_fp.get("status"),
+        "statusChanged": bool(prev) and prev.get("status") != cur_fp.get("status"),
+        "assetsAdded": sorted(cur_assets - prev_assets) if prev_has_assets else [],
+        "assetsRemoved": sorted(prev_assets - cur_assets) if prev_has_assets else [],
+        "domainsVersionChanged": bool(prev) and prev.get("domainsVersionId") != cur_fp.get("domainsVersionId"),
+        "roeVersionChanged": bool(prev) and prev.get("roeVersionId") != cur_fp.get("roeVersionId"),
     }
 
 
@@ -216,9 +246,15 @@ def _diff(prev_fp, cur_fp):
         out.append({"kind": "status",
                     "text": f"program status changed: {prev_fp.get('status')} -> {cur_fp.get('status')}"})
     if prev_fp.get("domainsVersionId") != cur_fp.get("domainsVersionId"):
+        d = _scope_delta(prev_fp, cur_fp)
+        detail = ""
+        if d["assetsAdded"]:
+            detail += " +[" + ", ".join(d["assetsAdded"]) + "]"
+        if d["assetsRemoved"]:
+            detail += " -[" + ", ".join(d["assetsRemoved"]) + "]"
         out.append({"kind": "domains-version",
                     "text": f"NEW scope (domains) version: {_fmt_ts(cur_fp.get('domainsCreatedAt'))} "
-                            f"(was {_fmt_ts(prev_fp.get('domainsCreatedAt'))}); re-run the scope-loader and diff assets"})
+                            f"(was {_fmt_ts(prev_fp.get('domainsCreatedAt'))});{detail or ' re-run the scope-loader and diff assets'}"})
     elif prev_fp.get("domainsCount") != cur_fp.get("domainsCount") and cur_fp.get("domainsCount") is not None:
         out.append({"kind": "domains-count",
                     "text": f"scope asset count changed: {prev_fp.get('domainsCount')} -> {cur_fp.get('domainsCount')} (same version id)"})
@@ -332,11 +368,13 @@ def cmd_fetch(argv):
         "program": prog,
         "fetchedAt": stamp,
         "fingerprint": cur_fp,
+        "delta": _scope_delta(prev_fp, cur_fp),
         "activitiesScanned": {"pages": scan_pages, "pageSize": PAGE_SIZE, "matched": len(activities),
                               "auto": bool(not explicit and changes)},
         "activities": activities,
-        "note": "Snapshot of the Intigriti program fingerprint (scope/ROE version ids + status). "
-                "No credentials stored. activities[] is a bounded best-effort scan of the global feed.",
+        "note": "Snapshot of the Intigriti program fingerprint (scope/ROE version ids + status + "
+                "asset list). delta is the change vs the previous snapshot, consumed by "
+                "pihunt-gadgets re-arm triggers (when_scope_added / when_status). No credentials stored.",
     }
     outdir = _snapshot_dir(prog)
     os.makedirs(outdir, exist_ok=True)
