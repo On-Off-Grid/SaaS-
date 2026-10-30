@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +47,8 @@ class _Model2VecBackend:
     def __init__(self) -> None:
         from model2vec import StaticModel  # lazy import
 
+        # Prefer the local snapshot unconditionally when it exists so the load
+        # never depends on network/HF-cache state and always matches the index.
         src = str(_LOCAL_MODEL) if _LOCAL_MODEL.exists() else "minishlab/potion-base-8M"
         self._m = StaticModel.from_pretrained(src)
         self.dim = int(self._m.encode(["probe"]).shape[1])
@@ -95,8 +98,14 @@ def get_embedder(force_fallback: bool = False):
             _BACKEND = _Model2VecBackend()
             return _BACKEND
         except Exception as e:  # noqa: BLE001
-            print(f"[embedder] model2vec unavailable ({type(e).__name__}: {str(e)[:80]}); "
-                  f"falling back to hashed-ngram")
+            # Keep the full message (not an 80-char slice): the cause is often a
+            # FileNotFoundError about some *unrelated* path pulled in by a
+            # shadowed stdlib import, and truncating it hid exactly that for a
+            # long time. Point the reader at the model dir so a genuine
+            # corrupt/missing snapshot is also obvious.
+            print(f"[embedder] model2vec unavailable ({type(e).__name__}: {e}); "
+                  f"local model dir={_LOCAL_MODEL} exists={_LOCAL_MODEL.exists()}; "
+                  f"falling back to hashed-ngram", file=sys.stderr)
     _BACKEND = _HashedNGramBackend()
     return _BACKEND
 
