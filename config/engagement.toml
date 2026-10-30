@@ -18,9 +18,33 @@ floor      = "HIGH"              # minimum severity to chase: LOW | MEDIUM | HIG
 # It is DEFENSE-IN-DEPTH against accidental out-of-scope requests, NOT a security
 # boundary (obfuscated shell can evade host extraction — see the tool header).
 #
-# Leave in_scope EMPTY to disable the guard (it then allows all hosts). Populate it
-# from your program's scope page to ACTIVATE: any external host not matched here is
-# challenged (localhost / private ranges are always allowed). Globs use fnmatch.
-in_scope        = []   # e.g. ["*.digitalocean.com", "api.digitalocean.com"]
-out_of_scope    = []   # e.g. ["status.digitalocean.com"] — always denied, even if in_scope matches
+# HOW IT DECIDES (per host found in a Bash/WebFetch call):
+#   - localhost / private ranges        -> always allowed, silently
+#   - matches an out_of_scope glob       -> DENIED (out_of_scope wins over in_scope)
+#   - matches an in_scope glob            -> allowed, silently
+#   - external + in_scope non-empty + unmatched -> CHALLENGED ("ask")
+#   - in_scope EMPTY                      -> guard disabled: all hosts allowed
+# Globs use fnmatch; "*.example.com" also covers the apex "example.com".
+#
+# Put your REAL scope in config/engagement.local.toml (git-ignored), NOT here.
+# The arrays below stay empty so a fresh clone ships with the guard OFF.
+#
+# ------------------------------------------------------------------------------
+# SANITIZED EXAMPLE (fake hosts — copy the shape into engagement.local.toml):
+#
+#   in_scope = [
+#     "*.example.com",            # wildcard: every subdomain + the apex
+#     "api.example.com",          # (explicit entries are fine alongside a wildcard)
+#     "203.0.113.42",             # a specific in-scope IP (e.g. a metadata endpoint)
+#     "example-partners.net",     # a second in-scope apex domain
+#   ]
+#   out_of_scope = [
+#     "*.customers.example.com",  # customer tenants under an otherwise in-scope wildcard
+#     "status.example.com",       # a named subdomain carved out of *.example.com
+#     "blog.example.com",         # another explicit carve-out (denied despite the wildcard)
+#   ]
+#   max_req_per_sec = 10
+# ------------------------------------------------------------------------------
+in_scope        = []   # populate in engagement.local.toml to ACTIVATE the guard
+out_of_scope    = []   # always denied, even when an in_scope glob would match
 max_req_per_sec = 10   # advisory rate floor surfaced to the operator
