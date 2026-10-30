@@ -55,10 +55,20 @@ accidental pivots. Layer it under the sandbox and Burp's `scope_check`.
 in_scope        = ["*.digitalocean.com", "api.digitalocean.com"]
 out_of_scope    = ["status.digitalocean.com"]
 max_req_per_sec = 10
+enforce         = "auto"
 ```
 
-- **`in_scope` empty → the guard is disabled** (allows all hosts). Populate it from
-  your program's scope page to activate.
+**When it enforces (`enforce`, default `auto`):** so it never nags during ordinary
+doc/dev work, the guard only challenges when a hunt is **live** or you switch it on:
+- `auto` — enforce only while a `pi` hunt is running (`pgrep -x pi`, the harness's
+  canonical live-hunt signal). Passive otherwise.
+- `always` — always enforce. `off`/`never` — never enforce (fully passive).
+- The `PIHUNT_SCOPE_GUARD` env var (`on|off|auto|always|never`), **set before
+  launching Claude Code**, overrides the config — e.g. `export PIHUNT_SCOPE_GUARD=on`
+  to force the guard on for a session.
+
+- **`in_scope` empty → the guard has no scope to check** (allows all hosts). Populate it
+  from your program's scope page.
 - `out_of_scope` is always denied, even if an `in_scope` glob would match.
 - `localhost` / private ranges are always allowed (local tooling).
 - Read by `pihunt_scope_list` / `pihunt_scope_get` in `lib/pihunt-common.sh`.

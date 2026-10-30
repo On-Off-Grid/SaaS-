@@ -18,7 +18,12 @@ floor      = "HIGH"              # minimum severity to chase: LOW | MEDIUM | HIG
 # It is DEFENSE-IN-DEPTH against accidental out-of-scope requests, NOT a security
 # boundary (obfuscated shell can evade host extraction — see the tool header).
 #
-# HOW IT DECIDES (per host found in a Bash/WebFetch call):
+# WHEN IT RUNS (enforcement gate): by default the guard only challenges while a
+# hunt is LIVE (a running `pi` process) or when the operator switches it on — so
+# ordinary doc/dev work is never prompted. Controlled by `enforce` below (or the
+# `PIHUNT_SCOPE_GUARD` env var, set before launch, which overrides it).
+#
+# HOW IT DECIDES (per host found in a Bash/WebFetch call, once enforcing):
 #   - localhost / private ranges        -> always allowed, silently
 #   - matches an out_of_scope glob       -> DENIED (out_of_scope wins over in_scope)
 #   - matches an in_scope glob            -> allowed, silently
@@ -45,6 +50,9 @@ floor      = "HIGH"              # minimum severity to chase: LOW | MEDIUM | HIG
 #   ]
 #   max_req_per_sec = 10
 # ------------------------------------------------------------------------------
-in_scope        = []   # populate in engagement.local.toml to ACTIVATE the guard
-out_of_scope    = []   # always denied, even when an in_scope glob would match
-max_req_per_sec = 10   # advisory rate floor surfaced to the operator
+in_scope        = []      # populate in engagement.local.toml to give the guard a scope
+out_of_scope    = []      # always denied, even when an in_scope glob would match
+max_req_per_sec = 10      # advisory rate floor surfaced to the operator
+enforce         = "auto"  # auto = challenge only during a live hunt (pgrep -x pi);
+                          # "always" = always on; "off" = passive. The PIHUNT_SCOPE_GUARD
+                          # env var (on|off|auto|always|never), set before launch, overrides this.
