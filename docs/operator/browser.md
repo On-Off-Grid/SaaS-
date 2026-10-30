@@ -42,6 +42,66 @@ A Chrome user-data-dir can be held by **one** process at a time. If the agents'
 browser-live Brave is live on a profile, `open` refuses (exit 3) — interact with the
 on-screen window, or stop the agents' browser first.
 
+## Account-aware tab tracking — do1 / do2 double-profiling
+
+Two-account authz testing needs **two logged-in accounts in the same Brave window**,
+with cookies that never bleed into each other, and the cockpit must always know which
+account owns the tab it is about to act on. The harness models this as two CDP
+**browser contexts** inside the one browser-live window:
+
+| Account | Team | Context | Lifetime |
+|---|---|---|---|
+| **do1** | `afa0ac` | the **default** context — the existing persistent per-program profile | survives across sessions |
+| **do2** | `d9c570` | an **ephemeral incognito** context created in the same window | own cookie jar; wiped on close; re-auth each session |
+
+The two contexts have **true cookie isolation** (separate jars), so do1 and do2 can be
+logged into the same site at once without one clobbering the other.
+
+The account↔context map is the only state this adds, a per-program registry:
+`reports/<program>/live-intel/browser-accounts.json` — `browserContextId → {account, team}`.
+The default context is recorded as do1 the first time it is seen; `open-account`
+records the incognito context as do2.
+
+```bash
+hunt-browser tabs                    # every open tab labeled do1 / do2 / UNKNOWN + url
+hunt-browser open-account do2 [url]  # create the incognito do2 context + a tab, register it
+hunt-browser whose-tab <targetId>    # print "do1 afa0ac <url>" / "do2 d9c570 <url>", else UNKNOWN
+```
+
+**How a tab is resolved to an account** (the detection keys on the CDP
+`browserContextId`, which the HTTP `/json` endpoint does NOT carry — only a
+`Target.getTargets` call over the CDP WebSocket returns it; the small
+`mcp-servers/browser-live/browser-live-targets.mjs` shim makes that call):
+
+1. If the tab's `browserContextId` is in the registry → that account.
+2. Else if it is the **default** context (never listed by `Target.getBrowserContexts`,
+   which only returns created/incognito contexts) → **do1**.
+3. Otherwise → **UNKNOWN**.
+
+### Fail-closed rule (safety-critical)
+
+Acting as the wrong account is a ROE violation. `whose-tab` therefore **never guesses**:
+when a tab's account can't be confidently determined (an unregistered incognito
+context, or a target that no longer exists) it prints `UNKNOWN` and **exits non-zero**
+(`4` for an unresolved context, `2` for a missing/absent targetId). The cockpit must
+treat a non-zero `whose-tab` as "do not act" — register the context first
+(`open-account do2`), then re-check.
+
+### Typical flow
+
+```bash
+hunt-browser open-account do2 https://target.example/login   # spawns + registers do2
+# → switch to the new tab in the on-screen Brave window and log in as do2
+hunt-browser tabs                                            # confirm do1 + do2 are labeled
+hunt-browser whose-tab <targetId>                            # gate before acting as an account
+```
+
+If `Target.createBrowserContext` ever isn't drivable on the deployed stack,
+`open-account do2` prints a fallback: open a private window by hand
+(Ctrl+Shift+N) in the browser-live Brave, then run `hunt-browser open-account do2
+--detect` to auto-detect that first non-default context and register it as do2.
+(Verified drivable against Brave 154 — the direct path is the default.)
+
 ## Linking Claude Code to your Brave (Browser MCP)
 
 The `mcp__browsermcp__*` server is already available in Claude Code. To connect it to
